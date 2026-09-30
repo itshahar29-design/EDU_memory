@@ -1,0 +1,42 @@
+====================================================================
+  EDU MEMORY ULTRA PRO — BARCHA YANGILANGAN FAYLLAR VA QO'LLANMA
+====================================================================
+
+Ushbu papka ichida butun yangilangan maktab platformasining barcha
+fayllari to'plangan:
+
+1. index.html
+   - Yangi "EDU MEMORY ULTRA PRO" interfeysi.
+   - 14 ta to'liq modul: Dashboard, Davomat, Baholar jurnali,
+     Uyga vazifalar, Ustozlar, Dars jadvali, O'quvchilar reytingi va dossyesi,
+     Elektron kutubxona, Onlayn test/quiz, Sinf fondi, Oshxona menyusi,
+     Maktab kalendari, E'lonlar, Ota-ona portali, Dark mode, Excel va Backup.
+   - Bu faylni sichqoncha bilan 2 marta bossangiz, sayt darhol brauzeringizda
+     to'liq ishlaydi!
+
+2. web_app.py
+   - Render bulutli serveri va sayt uchun backend kodi.
+   - Barcha API yo'nalishlari va yangi frontend bilan ta'minlangan.
+
+3. app/
+   - Telegram botning barcha yangilangan modullari (handlers, keyboards, models, database).
+
+4. main.py
+   - @EduMemoryBot Telegram botining asosiy ishga tushirish fayli.
+
+5. ISHGA_TUSHIRISH_SAYT.bat
+   - Bitta bosish orqali yangi saytni brauzerda ochadi.
+
+6. deploy.bat
+   - Yangi kodlarni GitHub va Renderga avtomatik yuklash skripti.
+
+====================================================================
+GITHUB VA RENDERGA YUKLASH BO'YICHA:
+1. Brauzeringizda quyidagi manzilni oching:
+   https://github.com/itshahar29-design/EDU_memory/tree/main/edu_memory
+2. "Add file" -> "Upload files" tugmasini bosing.
+3. Ushbu papkadagi "index.html" va "web_app.py" fayllarini sudrab tashlang.
+4. Pastdagi yashil "Commit changes" tugmasini bosing!
+5. Render 1-2 daqiqada yangi saytni https://edu-memory.onrender.com da
+   avtomatik ravishda yangilaydi!
+====================================================================

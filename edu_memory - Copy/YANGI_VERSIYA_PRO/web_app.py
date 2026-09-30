@@ -1,0 +1,2392 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import date, datetime, timedelta
+import json
+from pathlib import Path
+
+from aiohttp import web
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.database import create_engine, create_sessionmaker, init_db
+from app import repository as repo
+from app.texts import PRESENT, ABSENT, EXCUSED, stats_block, fmt_date
+from app.reports import weekly_period, monthly_period, _child_block
+
+DB_URL = "sqlite+aiosqlite:///attendance.db"
+engine = create_engine(DB_URL)
+sessionmaker: async_sessionmaker[AsyncSession] = create_sessionmaker(engine)
+
+# Standart ota-ona demo chat ID
+DEMO_PARENT_CHAT_ID = 10001
+
+
+async def populate_sample_data_if_empty(session: AsyncSession) -> None:
+    students = await repo.list_students(session)
+    if not students:
+        samples = [
+            "Ali Valiyev",
+            "Malika Karimova",
+            "Jasur Toshmatov",
+            "Zilola Rahimova",
+            "Bobur Oripov",
+        ]
+        created = []
+        for name in samples:
+            st = await repo.add_student(session, name)
+            created.append(st)
+
+        # Ota-onaga dastlabki 2 ta o'quvchini bog'lash
+        await repo.link_parent(session, DEMO_PARENT_CHAT_ID, created[0].id)
+        await repo.link_parent(session, DEMO_PARENT_CHAT_ID, created[1].id)
+
+        # O'tgan 3 kun uchun namuna davomat
+        today = date.today()
+        await repo.save_attendance(session, today - timedelta(days=2), {
+            created[0].id: PRESENT,
+            created[1].id: PRESENT,
+            created[2].id: PRESENT,
+            created[3].id: PRESENT,
+            created[4].id: ABSENT,
+        })
+        await repo.save_attendance(session, today - timedelta(days=1), {
+            created[0].id: PRESENT,
+            created[1].id: EXCUSED,
+            created[2].id: PRESENT,
+            created[3].id: PRESENT,
+            created[4].id: PRESENT,
+        })
+        await repo.save_attendance(session, today, {
+            created[0].id: PRESENT,
+            created[1].id: PRESENT,
+            created[2].id: ABSENT,
+            created[3].id: PRESENT,
+            created[4].id: PRESENT,
+        })
+
+
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="uz" class="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EDU MEMORY PRO — Maktab va Sinf Boshqaruv Tizimi</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50: '#eef2ff', 100: '#e0e7ff', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca', 800: '#3730a3', 900: '#312e81' }
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <script>
+    if (window.Telegram && window.Telegram.WebApp) {
+      window.Telegram.WebApp.ready();
+      window.Telegram.WebApp.expand();
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800;900&display=swap');
+    body { font-family: 'Plus Jakarta Sans', sans-serif; transition: background-color 0.3s, color 0.3s; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    @media print {
+      header, nav, .no-print, button, .modal, footer { display: none !important; }
+      body { background: white !important; color: black !important; }
+      .print-only { display: block !important; }
+    }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-100 min-h-screen flex flex-col antialiased">
+
+  <!-- Yuqori Navigatsiya paneli -->
+  <header class="bg-gradient-to-r from-indigo-950 via-indigo-900 to-slate-900 text-white shadow-xl sticky top-0 z-50 border-b border-indigo-800/40">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap justify-between items-center gap-3">
+      
+      <!-- Logo va Brend -->
+      <div class="flex items-center space-x-3 cursor-pointer" onclick="switchTab('dashboard')">
+        <div class="w-11 h-11 rounded-2xl bg-gradient-to-tr from-amber-400 to-indigo-500 flex items-center justify-center text-2xl shadow-lg border border-white/20">
+          🎓
+        </div>
+        <div>
+          <div class="flex items-center space-x-2">
+            <h1 class="text-xl font-black tracking-tight text-white">EDU MEMORY</h1>
+            <span class="px-2 py-0.5 rounded-full text-[10px] font-black bg-gradient-to-r from-amber-400 to-amber-500 text-slate-950 uppercase tracking-wider shadow-sm">ULTRA PRO</span>
+          </div>
+          <p class="text-xs text-indigo-200">Maktab, Sinf, Davomat va Ota-onalar Ekotizimi</p>
+        </div>
+      </div>
+
+      <!-- Tezkor Amallar va Sozlamalar -->
+      <div class="flex items-center space-x-2">
+        <div class="relative hidden lg:block">
+          <input type="text" id="globalSearchInput" onkeyup="handleGlobalSearch(event)" placeholder="Qidirish (ism, fan)..." class="bg-white/10 border border-white/20 rounded-xl px-3.5 py-1.5 pl-8 text-xs text-white placeholder-indigo-200 focus:outline-none focus:ring-2 focus:ring-amber-400 w-48 transition">
+          <i class="fa-solid fa-magnifying-glass absolute left-2.5 top-2.5 text-indigo-300 text-xs"></i>
+        </div>
+
+        <button onclick="toggleDarkMode()" title="Mavzuni o'zgartirish" class="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/20 text-amber-300 flex items-center justify-center text-sm transition border border-white/10">
+          <i id="themeIcon" class="fa-solid fa-moon"></i>
+        </button>
+
+        <button onclick="exportToCSV()" class="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-xs font-bold text-white flex items-center space-x-1.5 transition shadow-sm border border-emerald-500/30">
+          <i class="fa-solid fa-file-excel"></i>
+          <span class="hidden md:inline">Excel</span>
+        </button>
+
+        <button onclick="window.print()" class="px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-bold text-white flex items-center space-x-1.5 transition no-print border border-white/10">
+          <i class="fa-solid fa-print"></i>
+          <span class="hidden md:inline">Chop etish</span>
+        </button>
+
+        <button onclick="openModal('backupModal')" title="Zaxira nusxa" class="w-9 h-9 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 flex items-center justify-center text-sm transition border border-amber-400/30">
+          <i class="fa-solid fa-database"></i>
+        </button>
+      </div>
+    </div>
+
+    <!-- Menyu tablari -->
+    <nav class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex overflow-x-auto no-scrollbar space-x-1 pt-1 border-t border-indigo-800/40 text-xs font-bold">
+      <button onclick="switchTab('dashboard')" id="tabBtnDashboard" class="px-3 py-2.5 border-b-2 border-amber-400 text-amber-300 flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-chart-pie"></i>
+        <span>Dashboard</span>
+      </button>
+      <button onclick="switchTab('davomat')" id="tabBtnDavomat" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-calendar-check"></i>
+        <span>Davomat</span>
+      </button>
+      <button onclick="switchTab('grades')" id="tabBtnGrades" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-star"></i>
+        <span>Baholar</span>
+      </button>
+      <button onclick="switchTab('students')" id="tabBtnStudents" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-user-graduate"></i>
+        <span>O'quvchilar</span>
+      </button>
+      <button onclick="switchTab('teachers')" id="tabBtnTeachers" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-chalkboard-user"></i>
+        <span>Ustozlar</span>
+      </button>
+      <button onclick="switchTab('admins')" id="tabBtnAdmins" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-user-shield"></i>
+        <span>Adminlar</span>
+      </button>
+      <button onclick="switchTab('homework')" id="tabBtnHomework" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-book-open"></i>
+        <span>Vazifalar</span>
+      </button>
+      <button onclick="switchTab('schedule')" id="tabBtnSchedule" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-clock"></i>
+        <span>Jadval</span>
+      </button>
+      <button onclick="switchTab('library')" id="tabBtnLibrary" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-book-bookmark"></i>
+        <span>Kutubxona</span>
+      </button>
+      <button onclick="switchTab('quiz')" id="tabBtnQuiz" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-brain"></i>
+        <span>Test & Quiz</span>
+      </button>
+      <button onclick="switchTab('fund')" id="tabBtnFund" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-wallet"></i>
+        <span>Sinf Fondi</span>
+      </button>
+      <button onclick="switchTab('cafeteria')" id="tabBtnCafeteria" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-utensils"></i>
+        <span>Oshxona</span>
+      </button>
+      <button onclick="switchTab('calendar')" id="tabBtnCalendar" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-calendar-days"></i>
+        <span>Kalendar</span>
+      </button>
+      <button onclick="switchTab('announcements')" id="tabBtnAnnouncements" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-bullhorn"></i>
+        <span>E'lonlar</span>
+      </button>
+      <button onclick="switchTab('parent')" id="tabBtnParent" class="px-3 py-2.5 border-b-2 border-transparent text-indigo-200 hover:text-white flex items-center space-x-1.5 whitespace-nowrap transition">
+        <i class="fa-solid fa-house-user"></i>
+        <span>Ota-ona</span>
+      </button>
+    </nav>
+  </header>
+
+  <!-- Asosiy Dinamik Kontent -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full space-y-6">
+
+    <!-- ==================== TAB 1: DASHBOARD ==================== -->
+    <div id="tabDashboard" class="space-y-6">
+      <!-- 5 ta KPI Kartochkalari -->
+      <div class="grid grid-cols-2 lg:grid-cols-5 gap-3.5">
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-4 shadow-sm border border-slate-200/80 dark:border-slate-800 flex items-center space-x-3.5 cursor-pointer" onclick="switchTab('students')">
+          <div class="w-11 h-11 rounded-2xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400 flex items-center justify-center text-lg shrink-0">
+            <i class="fa-solid fa-user-graduate"></i>
+          </div>
+          <div>
+            <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">O'quvchilar</div>
+            <div id="dashTotalStudents" class="text-xl font-black text-slate-800 dark:text-white">0</div>
+            <div class="text-[10px] text-emerald-600 dark:text-emerald-400 font-bold">100% Faol</div>
+          </div>
+        </div>
+
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-4 shadow-sm border border-slate-200/80 dark:border-slate-800 flex items-center space-x-3.5 cursor-pointer" onclick="switchTab('teachers')">
+          <div class="w-11 h-11 rounded-2xl bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 flex items-center justify-center text-lg shrink-0">
+            <i class="fa-solid fa-chalkboard-user"></i>
+          </div>
+          <div>
+            <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Ustozlar</div>
+            <div id="dashTotalTeachers" class="text-xl font-black text-emerald-600 dark:text-emerald-400">0</div>
+            <div class="text-[10px] text-slate-400">Fan o'qituvchilari</div>
+          </div>
+        </div>
+
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-4 shadow-sm border border-slate-200/80 dark:border-slate-800 flex items-center space-x-3.5 cursor-pointer" onclick="switchTab('admins')">
+          <div class="w-11 h-11 rounded-2xl bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 flex items-center justify-center text-lg shrink-0">
+            <i class="fa-solid fa-user-shield"></i>
+          </div>
+          <div>
+            <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Adminlar</div>
+            <div id="dashTotalAdmins" class="text-xl font-black text-rose-600 dark:text-rose-400">0</div>
+            <div class="text-[10px] text-slate-400">Maktab ma'murlari</div>
+          </div>
+        </div>
+
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-4 shadow-sm border border-slate-200/80 dark:border-slate-800 flex items-center space-x-3.5 cursor-pointer" onclick="switchTab('davomat')">
+          <div class="w-11 h-11 rounded-2xl bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400 flex items-center justify-center text-lg shrink-0">
+            <i class="fa-solid fa-chart-line"></i>
+          </div>
+          <div>
+            <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Davomat %</div>
+            <div id="dashAvgAttendance" class="text-xl font-black text-blue-600 dark:text-blue-400">0%</div>
+            <div class="text-[10px] text-blue-500 font-bold">O'rtacha ko'rsatkich</div>
+          </div>
+        </div>
+
+        <div class="col-span-2 lg:col-span-1 bg-white dark:bg-slate-900 rounded-2xl p-4 shadow-sm border border-slate-200/80 dark:border-slate-800 flex items-center space-x-3.5 cursor-pointer" onclick="switchTab('fund')">
+          <div class="w-11 h-11 rounded-2xl bg-purple-50 dark:bg-purple-950/60 text-purple-600 dark:text-purple-400 flex items-center justify-center text-lg shrink-0">
+            <i class="fa-solid fa-wallet"></i>
+          </div>
+          <div>
+            <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Sinf Fondi</div>
+            <div id="dashFundBalance" class="text-lg font-black text-purple-600 dark:text-purple-400">0 so'm</div>
+            <div class="text-[10px] text-slate-400">Kassa balansi</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tezkor Qo'shish Tugmalari Paneli -->
+      <div class="bg-gradient-to-r from-indigo-900 to-slate-900 rounded-2xl p-4 text-white flex flex-wrap items-center justify-between gap-3 shadow-md">
+        <div class="flex items-center space-x-3">
+          <span class="text-2xl">⚡</span>
+          <div>
+            <div class="font-extrabold text-sm">Tezkor Boshqaruv Markazi</div>
+            <div class="text-xs text-indigo-200">1-klikda yangi o'quvchi, ustoz yoki admin qo'shing:</div>
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <button onclick="openModal('addStudentModal')" class="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-xs font-bold text-white transition flex items-center space-x-1.5 shadow-sm">
+            <i class="fa-solid fa-user-plus"></i>
+            <span>+ O'quvchi</span>
+          </button>
+          <button onclick="openModal('addTeacherModal')" class="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-xs font-bold text-white transition flex items-center space-x-1.5 shadow-sm">
+            <i class="fa-solid fa-chalkboard-user"></i>
+            <span>+ Ustoz</span>
+          </button>
+          <button onclick="openModal('addAdminModal')" class="px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-xs font-bold text-white transition flex items-center space-x-1.5 shadow-sm">
+            <i class="fa-solid fa-user-shield"></i>
+            <span>+ Admin</span>
+          </button>
+          <button onclick="openModal('addHomeworkModal')" class="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-xs font-bold text-white transition flex items-center space-x-1.5 shadow-sm">
+            <i class="fa-solid fa-book"></i>
+            <span>+ Vazifa</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Bugungi Davomat & Jonli Dars Zvonoklari -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="lg:col-span-2 bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4">
+          <div class="flex flex-wrap justify-between items-center gap-2">
+            <div>
+              <h3 class="font-extrabold text-base text-slate-800 dark:text-white flex items-center space-x-2">
+                <span>📋 Bugungi Davomat Holati</span>
+                <span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300" id="dashTodayDateLabel"></span>
+              </h3>
+              <p class="text-xs text-slate-400">Real-vaqt rejimida o'quvchilar ishtiroki</p>
+            </div>
+            <div class="flex items-center space-x-2">
+              <button onclick="switchTab('davomat')" class="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition shadow-sm">
+                Davomat olish →
+              </button>
+              <button onclick="shareAttendanceTelegram()" class="px-3 py-1.5 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300 text-xs font-bold transition" title="Telegramga hisobot nusxalash">
+                <i class="fa-brands fa-telegram"></i> Xabar
+              </button>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-3 gap-3 text-center">
+            <div class="bg-emerald-50 dark:bg-emerald-950/40 rounded-2xl p-3.5 border border-emerald-100 dark:border-emerald-900/50">
+              <div class="text-xs font-bold text-emerald-700 dark:text-emerald-300">🟢 Darsda Bor</div>
+              <div id="dashTodayPresent" class="text-2xl sm:text-3xl font-black text-emerald-600 dark:text-emerald-400 mt-1">0</div>
+            </div>
+            <div class="bg-rose-50 dark:bg-rose-950/40 rounded-2xl p-3.5 border border-rose-100 dark:border-rose-900/50">
+              <div class="text-xs font-bold text-rose-700 dark:text-rose-300">🔴 Darsda Yo'q</div>
+              <div id="dashTodayAbsent" class="text-2xl sm:text-3xl font-black text-rose-600 dark:text-rose-400 mt-1">0</div>
+            </div>
+            <div class="bg-amber-50 dark:bg-amber-950/40 rounded-2xl p-3.5 border border-amber-100 dark:border-amber-900/50">
+              <div class="text-xs font-bold text-amber-700 dark:text-amber-300">🟡 Sababli</div>
+              <div id="dashTodayExcused" class="text-2xl sm:text-3xl font-black text-amber-600 dark:text-amber-400 mt-1">0</div>
+            </div>
+          </div>
+
+          <div class="pt-2">
+            <div class="flex justify-between text-xs font-bold text-slate-600 dark:text-slate-300 mb-1.5">
+              <span>Davomat foizi:</span>
+              <span id="dashTodayPercent" class="text-emerald-600 dark:text-emerald-400 font-extrabold">0%</span>
+            </div>
+            <div class="w-full bg-slate-100 dark:bg-slate-800 h-3 rounded-full overflow-hidden">
+              <div id="dashTodayProgressBar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-3 rounded-full transition-all duration-700" style="width: 0%"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Jonli Zvonok & Hozirgi Dars Vidjeti -->
+        <div class="bg-gradient-to-br from-indigo-900 via-indigo-950 to-slate-900 text-white rounded-2xl p-6 shadow-sm border border-indigo-800/40 flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between mb-3">
+              <span class="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 uppercase tracking-widest flex items-center space-x-1">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                <span>JONLI EFIR</span>
+              </span>
+              <span id="liveClock" class="text-xs font-mono font-bold text-indigo-200">--:--:--</span>
+            </div>
+            <h4 class="text-sm font-bold text-indigo-200 uppercase tracking-wider">Hozirgi Dars Holati</h4>
+            <div id="currentLessonBox" class="mt-3 bg-white/10 rounded-2xl p-4 border border-white/10 space-y-2">
+              <div class="text-xs text-indigo-300" id="currentLessonTime">08:30 - 09:15</div>
+              <div class="text-lg font-black text-white" id="currentLessonSubject">Matematika</div>
+              <div class="text-xs text-slate-300 flex items-center space-x-2">
+                <i class="fa-solid fa-chalkboard-user text-amber-300"></i>
+                <span id="currentLessonTeacher">Nilufar Azimova (302-xona)</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-4 pt-3 border-t border-white/10 flex justify-between items-center text-xs">
+            <span class="text-indigo-200">Keyingi tanaffus:</span>
+            <span id="nextBreakTime" class="font-bold text-amber-300">10 daqiqadan so'ng</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Top O'quvchilar -->
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4">
+          <div class="flex justify-between items-center">
+            <h3 class="font-bold text-base text-slate-800 dark:text-white">⭐ Sinf A'lochilari (Top Reyting)</h3>
+            <span class="text-xs text-amber-500 font-bold"><i class="fa-solid fa-trophy"></i> GPA reyting</span>
+          </div>
+          <div id="topStudentsList" class="space-y-2.5"></div>
+        </div>
+
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4">
+          <div class="flex justify-between items-center">
+            <h3 class="font-bold text-base text-slate-800 dark:text-white">🔐 Rahbariyat va Adminlar</h3>
+            <button onclick="openModal('addAdminModal')" class="text-xs text-indigo-600 dark:text-indigo-400 font-bold hover:underline">+ Yangi Admin</button>
+          </div>
+          <div id="dashAdminsList" class="space-y-2.5"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 2: KUNLIK DAVOMAT ==================== -->
+    <div id="tabDavomat" class="space-y-6 hidden">
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4">
+        
+        <div class="flex flex-wrap justify-between items-center gap-3">
+          <div class="flex items-center space-x-3">
+            <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Sanani tanlang:</label>
+            <input type="date" id="attendanceDateInput" onchange="loadAttendanceForDate()" class="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3.5 py-2 text-sm font-bold focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+          </div>
+
+          <div class="flex items-center space-x-2">
+            <button onclick="setAllAttendance('present')" class="px-3 py-1.5 rounded-xl bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 text-xs font-bold hover:bg-emerald-100 transition border border-emerald-200 dark:border-emerald-800">
+              🟢 Barchasi Bor
+            </button>
+            <button onclick="setAllAttendance('absent')" class="px-3 py-1.5 rounded-xl bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-300 text-xs font-bold hover:bg-rose-100 transition border border-rose-200 dark:border-rose-800">
+              🔴 Barchasi Yo'q
+            </button>
+            <button onclick="saveAttendanceToast()" class="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-md transition">
+              💾 Saqlash
+            </button>
+          </div>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-sm">
+            <thead class="bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 text-xs uppercase font-extrabold border-y border-slate-100 dark:border-slate-800">
+              <tr>
+                <th class="px-4 py-3.5">#</th>
+                <th class="px-4 py-3.5">O'quvchining To'liq Ismi</th>
+                <th class="px-4 py-3.5">ID Kodi</th>
+                <th class="px-4 py-3.5 text-center">Davomat Holati (1-klikda)</th>
+                <th class="px-4 py-3.5 text-right">Aloqa</th>
+              </tr>
+            </thead>
+            <tbody id="attendanceTableBody" class="divide-y divide-slate-100 dark:divide-slate-800"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 3: BAHOLAR JURNALI ==================== -->
+    <div id="tabGrades" class="space-y-6 hidden">
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4">
+        
+        <div class="flex flex-wrap justify-between items-center gap-3">
+          <div class="flex items-center space-x-3">
+            <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Fanni tanlang:</label>
+            <select id="gradesSubjectSelect" onchange="renderGradesTable()" class="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-2 text-sm font-bold text-indigo-700 dark:text-indigo-300 focus:ring-2 focus:ring-indigo-500 focus:outline-none"></select>
+          </div>
+          <p class="text-xs text-slate-400">Har bir o'quvchiga 5, 4, 3 tezkor baho qo'yish mumkin</p>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-sm">
+            <thead class="bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 text-xs uppercase font-extrabold border-y border-slate-100 dark:border-slate-800">
+              <tr>
+                <th class="px-4 py-3.5">#</th>
+                <th class="px-4 py-3.5">O'quvchi Ismi</th>
+                <th class="px-4 py-3.5">Joriy Baholar</th>
+                <th class="px-4 py-3.5 text-center">O'rtacha Baho</th>
+                <th class="px-4 py-3.5 text-right">Baho Qo'yish</th>
+              </tr>
+            </thead>
+            <tbody id="gradesTableBody" class="divide-y divide-slate-100 dark:divide-slate-800"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 4: O'QUVCHILAR & REYTING ==================== -->
+    <div id="tabStudents" class="space-y-6 hidden">
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4">
+        <div class="flex flex-wrap justify-between items-center gap-3">
+          <div>
+            <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">👥 O'quvchilar Ro'yxati va Reytingi</h2>
+            <p class="text-xs text-slate-400">O'quvchi profiliga kirish uchun ustiga bosing</p>
+          </div>
+          <button onclick="openModal('addStudentModal')" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition flex items-center space-x-1.5 shadow-sm">
+            <i class="fa-solid fa-user-plus"></i>
+            <span>+ Yangi O'quvchi Qo'shish</span>
+          </button>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-sm">
+            <thead class="bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 text-xs uppercase font-extrabold border-y border-slate-100 dark:border-slate-800">
+              <tr>
+                <th class="px-4 py-3.5">#</th>
+                <th class="px-4 py-3.5">O'quvchi Ismi</th>
+                <th class="px-4 py-3.5">ID Kodi</th>
+                <th class="px-4 py-3.5 text-center">Davomat %</th>
+                <th class="px-4 py-3.5 text-center">GPA (Baho)</th>
+                <th class="px-4 py-3.5 text-right">Amal (O'chirish)</th>
+              </tr>
+            </thead>
+            <tbody id="studentsTableBody" class="divide-y divide-slate-100 dark:divide-slate-800"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 5: FAN USTOZLARI ==================== -->
+    <div id="tabTeachers" class="space-y-6 hidden">
+      <div class="flex justify-between items-center">
+        <div>
+          <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">👨‍🏫 Fan O'qituvchilari Katalogi</h2>
+          <p class="text-xs text-slate-400">Sinfga dars beruvchi ustozlar ro'yxati</p>
+        </div>
+        <button onclick="openModal('addTeacherModal')" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center space-x-2 transition shadow-sm">
+          <i class="fa-solid fa-user-plus"></i>
+          <span>+ Ustoz Qo'shish</span>
+        </button>
+      </div>
+
+      <div id="teachersGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+    </div>
+
+    <!-- ==================== TAB 6: ADMINLAR VA XODIMLAR ==================== -->
+    <div id="tabAdmins" class="space-y-6 hidden">
+      <div class="flex justify-between items-center">
+        <div>
+          <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">🔐 Maktab Rahbariyati va Adminlar</h2>
+          <p class="text-xs text-slate-400">Direktor, Zauch, Sinf rahbari va Tizim administratorlari</p>
+        </div>
+        <button onclick="openModal('addAdminModal')" class="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center space-x-2 transition shadow-sm">
+          <i class="fa-solid fa-user-shield"></i>
+          <span>+ Admin Qo'shish</span>
+        </button>
+      </div>
+
+      <div id="adminsGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+    </div>
+
+    <!-- ==================== TAB 7: UYGA VAZIFALAR ==================== -->
+    <div id="tabHomework" class="space-y-6 hidden">
+      <div class="flex justify-between items-center">
+        <div>
+          <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">📚 Uyga Vazifalar va Topshiriqlar</h2>
+          <p class="text-xs text-slate-400">Fanlar kesimida berilgan vazifalar va topshirish muddatlari</p>
+        </div>
+        <button onclick="openModal('addHomeworkModal')" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center space-x-2 transition shadow-sm">
+          <i class="fa-solid fa-plus"></i>
+          <span>+ Vazifa Berish</span>
+        </button>
+      </div>
+
+      <div id="homeworkList" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+    </div>
+
+    <!-- ==================== TAB 8: DARS JADVALI ==================== -->
+    <div id="tabSchedule" class="space-y-6 hidden">
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-5">
+        <div class="flex flex-wrap gap-2 border-b border-slate-100 dark:border-slate-800 pb-4">
+          <button onclick="selectScheduleDay('dushanba')" data-day="dushanba" class="schedule-day-btn px-4 py-2 rounded-xl text-xs font-bold transition bg-indigo-600 text-white shadow-sm">Dushanba</button>
+          <button onclick="selectScheduleDay('seshanba')" data-day="seshanba" class="schedule-day-btn px-4 py-2 rounded-xl text-xs font-bold transition text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800">Seshanba</button>
+          <button onclick="selectScheduleDay('chorshanba')" data-day="chorshanba" class="schedule-day-btn px-4 py-2 rounded-xl text-xs font-bold transition text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800">Chorshanba</button>
+          <button onclick="selectScheduleDay('payshanba')" data-day="payshanba" class="schedule-day-btn px-4 py-2 rounded-xl text-xs font-bold transition text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800">Payshanba</button>
+          <button onclick="selectScheduleDay('juma')" data-day="juma" class="schedule-day-btn px-4 py-2 rounded-xl text-xs font-bold transition text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800">Juma</button>
+          <button onclick="selectScheduleDay('shanba')" data-day="shanba" class="schedule-day-btn px-4 py-2 rounded-xl text-xs font-bold transition text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800">Shanba</button>
+        </div>
+
+        <div id="scheduleItemsContainer" class="divide-y divide-slate-100 dark:divide-slate-800"></div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 9: ELEKTRON KUTUBXONA ==================== -->
+    <div id="tabLibrary" class="space-y-6 hidden">
+      <div class="flex justify-between items-center">
+        <div>
+          <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">📖 Maktab Elektron Kutubxonasi</h2>
+          <p class="text-xs text-slate-400">Darsliklar va badiiy kitoblar to'plami</p>
+        </div>
+        <select id="libraryFilter" onchange="renderLibrary()" class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl px-3 py-1.5 text-xs font-bold">
+          <option value="all">Barcha kitoblar</option>
+          <option value="darslik">Darsliklar</option>
+          <option value="badiiy">Badiiy adabiyot</option>
+        </select>
+      </div>
+
+      <div id="libraryGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+    </div>
+
+    <!-- ==================== TAB 10: ONLAYN TEST & VIKTORINA ==================== -->
+    <div id="tabQuiz" class="space-y-6 hidden">
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-6">
+        <div class="flex justify-between items-center">
+          <div>
+            <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">🧠 Onlayn Bilimlar Sinovi (Quiz)</h2>
+            <p class="text-xs text-slate-400">Interaktiv test savollari va natijalar</p>
+          </div>
+          <button onclick="restartQuiz()" class="px-3.5 py-1.5 rounded-xl bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300 text-xs font-bold hover:bg-indigo-100 transition">
+            <i class="fa-solid fa-rotate-right"></i> Qayta boshlash
+          </button>
+        </div>
+
+        <div id="quizContainer" class="space-y-5"></div>
+
+        <div id="quizResult" class="hidden p-6 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-600 text-white text-center space-y-3">
+          <div class="text-4xl">🎉</div>
+          <h3 class="text-xl font-black">Tabriklaymiz! Test yakunlandi!</h3>
+          <p id="quizScoreText" class="text-sm font-semibold"></p>
+          <div class="inline-block px-4 py-1.5 rounded-full bg-white/20 text-xs font-black uppercase tracking-wider">A'LO NATIJA (5 BAHOLIK SERTIFIKAT)</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 11: SINF FONDI ==================== -->
+    <div id="tabFund" class="space-y-6 hidden">
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800">
+          <div class="text-xs font-bold text-slate-400 uppercase">Joriy Balans</div>
+          <div id="fundCardBalance" class="text-2xl font-black text-slate-800 dark:text-white mt-1">0 so'm</div>
+          <div class="text-xs text-emerald-600 font-semibold mt-1">Kassa holati</div>
+        </div>
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800">
+          <div class="text-xs font-bold text-slate-400 uppercase">Jami Kirim</div>
+          <div id="fundCardIncome" class="text-2xl font-black text-emerald-600 mt-1">0 so'm</div>
+          <div class="text-xs text-slate-400 mt-1">Yig'ilgan badal</div>
+        </div>
+        <div class="bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800">
+          <div class="text-xs font-bold text-slate-400 uppercase">Jami Chiqim</div>
+          <div id="fundCardExpense" class="text-2xl font-black text-rose-600 mt-1">0 so'm</div>
+          <div class="text-xs text-slate-400 mt-1">Xarajatlar</div>
+        </div>
+      </div>
+
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4">
+        <div class="flex justify-between items-center">
+          <h3 class="font-bold text-base text-slate-800 dark:text-white">🧾 Kirim va Chiqim Amallari</h3>
+          <button onclick="openModal('addFundModal')" class="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center space-x-1.5 transition">
+            <i class="fa-solid fa-plus"></i>
+            <span>+ Yangi Amal</span>
+          </button>
+        </div>
+
+        <div id="fundTransactionsList" class="divide-y divide-slate-100 dark:divide-slate-800"></div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 12: MAKTAB OSHXONASI ==================== -->
+    <div id="tabCafeteria" class="space-y-6 hidden">
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4">
+        <div>
+          <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">🍲 Maktab Oshxonasi Haftalik Taomnomasi</h2>
+          <p class="text-xs text-slate-400">Sog'lom ovqatlanish me'yori</p>
+        </div>
+
+        <div id="cafeteriaGrid" class="grid grid-cols-1 md:grid-cols-3 gap-4"></div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 13: MAKTAB KALENDARI ==================== -->
+    <div id="tabCalendar" class="space-y-6 hidden">
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-5">
+        <div>
+          <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">🗓️ O'quv Yili Kalendari va Muhim Sanalar</h2>
+          <p class="text-xs text-slate-400">Choraklar va ta'tillar</p>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div class="p-4 rounded-2xl bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-100 dark:border-indigo-900/40">
+            <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-600 text-white">1-CHORAK</span>
+            <div class="font-black text-slate-800 dark:text-white mt-2">2-Sentabr — 4-Noyabr</div>
+            <div class="text-xs text-slate-500 mt-1">Kuzgi ta'til: 4 — 10-Noyabr</div>
+          </div>
+          <div class="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-100 dark:border-emerald-900/40">
+            <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-600 text-white">2-CHORAK</span>
+            <div class="font-black text-slate-800 dark:text-white mt-2">11-Noyabr — 27-Dekabr</div>
+            <div class="text-xs text-slate-500 mt-1">Qishki ta'til: 28-Dek — 10-Yan</div>
+          </div>
+          <div class="p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-100 dark:border-amber-900/40">
+            <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-600 text-white">3-CHORAK</span>
+            <div class="font-black text-slate-800 dark:text-white mt-2">11-Yanvar — 20-Mart</div>
+            <div class="text-xs text-slate-500 mt-1">Bahorgi ta'til: 21 — 27-Mart</div>
+          </div>
+          <div class="p-4 rounded-2xl bg-purple-50 dark:bg-purple-950/40 border border-purple-100 dark:border-purple-900/40">
+            <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-purple-600 text-white">4-CHORAK</span>
+            <div class="font-black text-slate-800 dark:text-white mt-2">28-Mart — 25-May</div>
+            <div class="text-xs text-slate-500 mt-1">Yozgi ta'til: 26-May — 1-Sen</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== TAB 14: E'LONLAR ==================== -->
+    <div id="tabAnnouncements" class="space-y-6 hidden">
+      <div class="flex justify-between items-center">
+        <div>
+          <h2 class="text-lg font-extrabold text-slate-800 dark:text-white">📢 Sinf va Maktab E'lonlari</h2>
+          <p class="text-xs text-slate-400">Rahbariyat va o'qituvchilar xabarlari</p>
+        </div>
+        <button onclick="openModal('addAnnouncementModal')" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center space-x-2 transition shadow-sm">
+          <i class="fa-solid fa-plus"></i>
+          <span>+ Yangi E'lon</span>
+        </button>
+      </div>
+
+      <div id="announcementsList" class="space-y-3"></div>
+    </div>
+
+    <!-- ==================== TAB 15: OTA-ONA PORTALI ==================== -->
+    <div id="tabParent" class="space-y-6 hidden">
+      <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200/80 dark:border-slate-800">
+        <div class="max-w-xl">
+          <h2 class="text-lg font-extrabold text-slate-800 dark:text-white mb-1">👨‍👩‍👧‍👦 Ota-ona Portali</h2>
+          <p class="text-xs text-slate-400 mb-4">Farzandingizning 6 xonali ID kodini kiriting (masalan: <code class="bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-indigo-600 dark:text-indigo-400 font-mono font-bold">WXR58P</code> yoki <code class="bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-indigo-600 dark:text-indigo-400 font-mono font-bold">5JHBTJ</code>):</p>
+          <form onsubmit="linkParent(event)" class="flex items-center space-x-2">
+            <input type="text" id="parentStudentCode" required placeholder="Masalan: WXR58P" class="border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-4 py-2.5 text-sm uppercase tracking-widest font-mono font-bold focus:ring-2 focus:ring-indigo-500 focus:outline-none flex-1">
+            <button type="submit" class="px-5 py-2.5 text-sm font-bold rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition">
+              Bog'lash
+            </button>
+          </form>
+        </div>
+      </div>
+
+      <div>
+        <h3 class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3">Farzandlaringiz Kundaligi</h3>
+        <div id="parentChildrenList" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ==================== MODALLAR ==================== -->
+
+  <!-- MODAL: O'chirishni Tasdiqlash (Kafolatlangan o'chirish) -->
+  <div id="deleteConfirmModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-sm w-full shadow-2xl space-y-4 border border-slate-100 dark:border-slate-800 text-center">
+      <div class="w-14 h-14 rounded-2xl bg-rose-50 dark:bg-rose-950/50 text-rose-600 text-2xl flex items-center justify-center mx-auto">
+        <i class="fa-solid fa-trash-can"></i>
+      </div>
+      <div>
+        <h3 class="text-base font-extrabold">O'chirishni tasdiqlang</h3>
+        <p class="text-xs text-slate-400 mt-1" id="deleteConfirmText">Haqiqatan ham bu yozuvni o'chirmoqchimisiz?</p>
+      </div>
+      <div class="grid grid-cols-2 gap-2 pt-2">
+        <button onclick="closeModal('deleteConfirmModal')" class="py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-xs font-bold text-slate-700 dark:text-slate-300">Bekor qilish</button>
+        <button id="deleteConfirmActionBtn" class="py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-xs font-bold text-white shadow-md">Ha, o'chirish</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: Yangi O'quvchi Qo'shish -->
+  <div id="addStudentModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-100 dark:border-slate-800">
+      <div class="flex justify-between items-center">
+        <h3 class="text-base font-extrabold flex items-center space-x-2">
+          <span class="w-8 h-8 rounded-lg bg-indigo-50 dark:bg-indigo-950 text-indigo-600 flex items-center justify-center text-sm"><i class="fa-solid fa-user-plus"></i></span>
+          <span>Yangi O'quvchi Qo'shish</span>
+        </h3>
+        <button onclick="closeModal('addStudentModal')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <form onsubmit="handleAddNewStudent(event)" class="space-y-3">
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">O'quvchi F.I.SH:</label>
+          <input type="text" id="newStudentFullName" required placeholder="Masalan: Sardor Rustamov" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Telefon Raqami:</label>
+          <input type="text" id="newStudentPhone" placeholder="+998 90 123 45 67" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Ota-onasi Ismi:</label>
+          <input type="text" id="newStudentParent" placeholder="Masalan: Rustam aka (Otasi)" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div class="pt-2 flex justify-end space-x-2">
+          <button type="button" onclick="closeModal('addStudentModal')" class="px-4 py-2 text-xs font-bold rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">Bekor qilish</button>
+          <button type="submit" class="px-5 py-2 text-xs font-bold rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition">Saqlash</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Yangi Ustoz Qo'shish -->
+  <div id="addTeacherModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-100 dark:border-slate-800">
+      <div class="flex justify-between items-center">
+        <h3 class="text-base font-extrabold flex items-center space-x-2">
+          <span class="w-8 h-8 rounded-lg bg-emerald-50 dark:bg-emerald-950 text-emerald-600 flex items-center justify-center text-sm"><i class="fa-solid fa-chalkboard-user"></i></span>
+          <span>Yangi Ustoz Qo'shish</span>
+        </h3>
+        <button onclick="closeModal('addTeacherModal')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <form onsubmit="handleAddNewTeacher(event)" class="space-y-3">
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Ustoz F.I.SH:</label>
+          <input type="text" id="teacherFullName" required placeholder="Masalan: Dilnoza Karimova" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Dars Beradigan Fani:</label>
+          <input type="text" id="teacherSubject" required placeholder="Masalan: Kimyo" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Telefon Raqami:</label>
+          <input type="text" id="teacherPhone" required placeholder="+998 90 123 45 67" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Xona raqami:</label>
+          <input type="text" id="teacherRoom" placeholder="Masalan: 304-laboratoriya" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div class="pt-2 flex justify-end space-x-2">
+          <button type="button" onclick="closeModal('addTeacherModal')" class="px-4 py-2 text-xs font-bold rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">Bekor qilish</button>
+          <button type="submit" class="px-5 py-2 text-xs font-bold rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 transition">Saqlash</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Yangi Admin Qo'shish -->
+  <div id="addAdminModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-100 dark:border-slate-800">
+      <div class="flex justify-between items-center">
+        <h3 class="text-base font-extrabold flex items-center space-x-2">
+          <span class="w-8 h-8 rounded-lg bg-rose-50 dark:bg-rose-950 text-rose-600 flex items-center justify-center text-sm"><i class="fa-solid fa-user-shield"></i></span>
+          <span>Yangi Maktab Admini Qo'shish</span>
+        </h3>
+        <button onclick="closeModal('addAdminModal')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <form onsubmit="handleAddNewAdmin(event)" class="space-y-3">
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Admin F.I.SH:</label>
+          <input type="text" id="adminFullName" required placeholder="Masalan: Jamshid Aliyev" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Lavozimi / Mas'uliyati:</label>
+          <select id="adminRole" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm font-bold focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+            <option value="Maktab Direktori">Maktab Direktori</option>
+            <option value="O'quv ishlari bo'yicha zauch">O'quv ishlari bo'yicha zauch</option>
+            <option value="Ma'naviyat bo'yicha o'rinbosar">Ma'naviyat bo'yicha o'rinbosar</option>
+            <option value="Sinf Rahbari">Sinf Rahbari</option>
+            <option value="IT Administrator">IT Administrator</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Telegram Chat ID raqami:</label>
+          <input type="text" id="adminTelegramId" placeholder="Masalan: 8575524875" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Telefon Raqami:</label>
+          <input type="text" id="adminPhone" placeholder="+998 90 999 88 77" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div class="pt-2 flex justify-end space-x-2">
+          <button type="button" onclick="closeModal('addAdminModal')" class="px-4 py-2 text-xs font-bold rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">Bekor qilish</button>
+          <button type="submit" class="px-5 py-2 text-xs font-bold rounded-xl bg-rose-600 text-white hover:bg-rose-700 transition">Adminni Qo'shish</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: O'quvchi Dossiyesi / Profil Kartochkasi -->
+  <div id="studentProfileModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-lg w-full shadow-2xl space-y-4 overflow-y-auto max-h-[90vh] border border-slate-100 dark:border-slate-800">
+      <div class="flex justify-between items-start border-b border-slate-100 dark:border-slate-800 pb-3">
+        <div class="flex items-center space-x-3">
+          <div class="w-14 h-14 rounded-2xl bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 font-black text-xl flex items-center justify-center border border-indigo-100 dark:border-indigo-900" id="modalStudentAvatar">
+            AV
+          </div>
+          <div>
+            <h3 class="text-lg font-black" id="modalStudentName">Ali Valiyev</h3>
+            <span class="text-xs font-mono font-bold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950 px-2 py-0.5 rounded" id="modalStudentCode">ID: WXR58P</span>
+          </div>
+        </div>
+        <button onclick="closeModal('studentProfileModal')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-xl"></i></button>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3 text-xs">
+        <div class="bg-slate-50 dark:bg-slate-800/60 p-3 rounded-xl border border-slate-100 dark:border-slate-800">
+          <div class="text-slate-400 font-bold uppercase text-[10px]">Davomat Foizi</div>
+          <div class="text-lg font-black text-emerald-600 dark:text-emerald-400 mt-0.5" id="modalStudentAttendance">100%</div>
+        </div>
+        <div class="bg-slate-50 dark:bg-slate-800/60 p-3 rounded-xl border border-slate-100 dark:border-slate-800">
+          <div class="text-slate-400 font-bold uppercase text-[10px]">O'rtacha Baho (GPA)</div>
+          <div class="text-lg font-black text-amber-500 mt-0.5" id="modalStudentGPA">4.8 / 5.0</div>
+        </div>
+      </div>
+
+      <div>
+        <h4 class="text-xs font-extrabold uppercase tracking-wider mb-2 text-slate-500 dark:text-slate-400">Fanlar Bo'yicha Baholar:</h4>
+        <div class="space-y-1.5" id="modalStudentGradesList"></div>
+      </div>
+
+      <div class="pt-2 border-t border-slate-100 dark:border-slate-800 flex justify-end">
+        <button onclick="closeModal('studentProfileModal')" class="px-5 py-2 text-xs font-bold rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-300">Yopish</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: Yangi Uyga Vazifa Berish -->
+  <div id="addHomeworkModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-100 dark:border-slate-800">
+      <div class="flex justify-between items-center">
+        <h3 class="text-base font-extrabold">📚 Yangi Uyga Vazifa Biriktirish</h3>
+        <button onclick="closeModal('addHomeworkModal')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <form onsubmit="handleAddNewHomework(event)" class="space-y-3">
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Fanni tanlang:</label>
+          <select id="hwSubject" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"></select>
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Vazifa Tafsilotlari:</label>
+          <textarea id="hwTask" required rows="3" placeholder="Masalan: 45-bet, 12, 13, 14-misollar..." class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"></textarea>
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Topshirish Muddati:</label>
+          <input type="date" id="hwDueDate" required class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div class="pt-2 flex justify-end space-x-2">
+          <button type="button" onclick="closeModal('addHomeworkModal')" class="px-4 py-2 text-xs font-bold rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">Bekor qilish</button>
+          <button type="submit" class="px-5 py-2 text-xs font-bold rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition">Biriktirish</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Kassa Kirim/Chiqim -->
+  <div id="addFundModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-100 dark:border-slate-800">
+      <div class="flex justify-between items-center">
+        <h3 class="text-base font-extrabold">💰 Kassa Kirim / Chiqimi</h3>
+        <button onclick="closeModal('addFundModal')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <form onsubmit="handleAddNewFund(event)" class="space-y-3">
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Amal turi:</label>
+          <select id="fundType" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm font-bold focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+            <option value="income">🟢 Kirim (Badal to'lovi)</option>
+            <option value="expense">🔴 Chiqim (Xarajat)</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Tavsifi / Maqsadi:</label>
+          <input type="text" id="fundDesc" required placeholder="Masalan: Sinf kutubxonasi uchun kitoblar" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">Summa (so'm):</label>
+          <input type="number" id="fundAmount" required placeholder="100000" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div class="pt-2 flex justify-end space-x-2">
+          <button type="button" onclick="closeModal('addFundModal')" class="px-4 py-2 text-xs font-bold rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">Bekor qilish</button>
+          <button type="submit" class="px-5 py-2 text-xs font-bold rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition">Qo'shish</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Yangi E'lon Qo'shish -->
+  <div id="addAnnouncementModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-100 dark:border-slate-800">
+      <div class="flex justify-between items-center">
+        <h3 class="text-base font-extrabold">📢 Yangi E'lon Yaratish</h3>
+        <button onclick="closeModal('addAnnouncementModal')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <form onsubmit="handleAddNewAnnouncement(event)" class="space-y-3">
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">E'lon Sarlavhasi:</label>
+          <input type="text" id="announcementTitle" required placeholder="Masalan: Shanba kuni ota-onalar majlisi" class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-slate-500 dark:text-slate-400">E'lon Matni:</label>
+          <textarea id="announcementText" required rows="3" placeholder="E'lon tafsilotlarini yozing..." class="w-full mt-1 border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"></textarea>
+        </div>
+        <div class="pt-2 flex justify-end space-x-2">
+          <button type="button" onclick="closeModal('addAnnouncementModal')" class="px-4 py-2 text-xs font-bold rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">Bekor qilish</button>
+          <button type="submit" class="px-5 py-2 text-xs font-bold rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition">E'lon qilish</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: Zaxiralash va Tiklash -->
+  <div id="backupModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 rounded-3xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-100 dark:border-slate-800">
+      <div class="flex justify-between items-center">
+        <h3 class="text-base font-extrabold">💾 Zaxiralash va Tiklash</h3>
+        <button onclick="closeModal('backupModal')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3 pt-2">
+        <button onclick="exportBackupJSON()" class="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center justify-center space-x-2 transition">
+          <i class="fa-solid fa-download"></i>
+          <span>Zaxira Nusxani Yuklab Olish (JSON)</span>
+        </button>
+        <button onclick="resetToSampleData()" class="w-full py-2 px-4 rounded-xl bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-300 text-xs font-bold hover:bg-rose-100 transition border border-rose-200 dark:border-rose-900">
+          Standart ma'lumotlarni qayta tiklash
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer class="bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 py-4 text-center text-xs text-slate-400 no-print">
+    EDU MEMORY ULTRA PRO &copy; 2026 — O'zbekiston Maktablari Uchun Raqamli Ta'lim Tizimi
+  </footer>
+
+  <!-- ==================== JAVASCRIPT VA MANTIQ ==================== -->
+  <script>
+    // Dastlabki namunaviy ma'lumotlar
+    const INITIAL_ADMINS = [
+      { id: 1, full_name: "Aliyev Jamshid Rustamovich", role: "Maktab Direktori", phone: "+998 90 123 45 67", telegram_id: "8575524875", avatar: "👨‍💼" },
+      { id: 2, full_name: "Karimova Nargiza Baxtiyorovna", role: "O'quv ishlari bo'yicha zauch", phone: "+998 91 234 56 78", telegram_id: "77665544", avatar: "👩‍💼" },
+      { id: 3, full_name: "Azimova Nilufar Anvarovna", role: "Sinf Rahbari", phone: "+998 90 111 22 33", telegram_id: "8831381677", avatar: "👩‍🏫" }
+    ];
+
+    const INITIAL_TEACHERS = [
+      { id: 1, full_name: "Nilufar Azimova", subject: "Matematika", phone: "+998 90 111 22 33", room: "302-xona", avatar: "👩‍🏫" },
+      { id: 2, full_name: "Sherzod Rahimov", subject: "Ona tili va Adabiyot", phone: "+998 93 444 55 66", room: "205-xona", avatar: "👨‍🏫" },
+      { id: 3, full_name: "Zuhra Qodirova", subject: "Ingliz tili", phone: "+998 97 777 88 99", room: "108-xona", avatar: "👩‍🏫" },
+      { id: 4, full_name: "Davron Aliyev", subject: "Fizika", phone: "+998 99 222 33 44", room: "401-laboratoriya", avatar: "👨‍🏫" },
+      { id: 5, full_name: "Gulbahor Karimova", subject: "Biologiya", phone: "+998 91 555 66 77", room: "304-xona", avatar: "👩‍🏫" },
+      { id: 6, full_name: "Jasur Oripov", subject: "Informatika", phone: "+998 90 999 00 11", room: "Kompyuter zali", avatar: "👨‍🏫" }
+    ];
+
+    const INITIAL_STUDENTS = [
+      { id: 1, full_name: "Ali Valiyev", student_code: "WXR58P", phone: "+998 90 333 44 55", parent_name: "Vali aka (Otasi)" },
+      { id: 2, full_name: "Malika Karimova", student_code: "5JHBTJ", phone: "+998 91 222 11 00", parent_name: "Nargiza opa (Onasi)" },
+      { id: 3, full_name: "Jasur Toshmatov", student_code: "996ERP", phone: "+998 97 444 33 22", parent_name: "Toshmat aka (Otasi)" },
+      { id: 4, full_name: "Zilola Rahimova", student_code: "KUBMC5", phone: "+998 99 888 77 66", parent_name: "Rahima opa (Onasi)" },
+      { id: 5, full_name: "Bobur Oripov", student_code: "XYYQBJ", phone: "+998 94 555 66 77", parent_name: "Orip aka (Otasi)" },
+      { id: 6, full_name: "Shahzod Nazarov", student_code: "M7K2LA", phone: "+998 93 111 99 88", parent_name: "Nazar aka (Otasi)" }
+    ];
+
+    const INITIAL_SCHEDULE = {
+      dushanba: [
+        { time: "08:30 - 09:15", subject: "Matematika", teacher: "Nilufar Azimova", room: "302-xona" },
+        { time: "09:25 - 10:10", subject: "Ona tili", teacher: "Sherzod Rahimov", room: "205-xona" },
+        { time: "10:30 - 11:15", subject: "Ingliz tili", teacher: "Zuhra Qodirova", room: "108-xona" },
+        { time: "11:25 - 12:10", subject: "Fizika", teacher: "Davron Aliyev", room: "401-xona" }
+      ],
+      seshanba: [
+        { time: "08:30 - 09:15", subject: "Biologiya", teacher: "Gulbahor Karimova", room: "304-xona" },
+        { time: "09:25 - 10:10", subject: "Informatika", teacher: "Jasur Oripov", room: "Kompyuter zali" },
+        { time: "10:30 - 11:15", subject: "Matematika", teacher: "Nilufar Azimova", room: "302-xona" },
+        { time: "11:25 - 12:10", subject: "Kimyo", teacher: "Gulbahor Karimova", room: "304-xona" }
+      ],
+      chorshanba: [
+        { time: "08:30 - 09:15", subject: "Ingliz tili", teacher: "Zuhra Qodirova", room: "108-xona" },
+        { time: "09:25 - 10:10", subject: "Fizika", teacher: "Davron Aliyev", room: "401-xona" },
+        { time: "10:30 - 11:15", subject: "Ona tili", teacher: "Sherzod Rahimov", room: "205-xona" }
+      ],
+      payshanba: [
+        { time: "08:30 - 09:15", subject: "Matematika", teacher: "Nilufar Azimova", room: "302-xona" },
+        { time: "09:25 - 10:10", subject: "Biologiya", teacher: "Gulbahor Karimova", room: "304-xona" }
+      ],
+      juma: [
+        { time: "08:30 - 09:15", subject: "Informatika", teacher: "Jasur Oripov", room: "Kompyuter zali" },
+        { time: "09:25 - 10:10", subject: "Ona tili", teacher: "Sherzod Rahimov", room: "205-xona" }
+      ],
+      shanba: [
+        { time: "08:30 - 09:15", subject: "Matematika to'garak", teacher: "Nilufar Azimova", room: "302-xona" }
+      ]
+    };
+
+    const INITIAL_HOMEWORK = [
+      { id: 1, subject: "Matematika", task: "45-betdagi 12, 13, 14-misollar. Formulalarni yodlash.", dueDate: "02.10.2026", status: "active" },
+      { id: 2, subject: "Ingliz tili", task: "Unit 3: Yangi so'zlarni yodlash va matn tarjimasi.", dueDate: "01.10.2026", status: "active" },
+      { id: 3, subject: "Fizika", task: "Nyuton qonunlari bo'yicha amaliy tajriba hisoboti.", dueDate: "03.10.2026", status: "active" }
+    ];
+
+    const INITIAL_FUND = [
+      { id: 1, type: "income", desc: "Sentyabr oylik sinf jamg'armasi (24 nafar)", amount: 2400000, date: "10.09.2026" },
+      { id: 2, type: "expense", desc: "Sinf tozalik vositalari to'plami", amount: 350000, date: "15.09.2026" }
+    ];
+
+    const INITIAL_ANNOUNCEMENTS = [
+      { id: 1, title: "🔔 Shanba kuni soat 10:00 da Ota-onalar majlisi", text: "Hurmatli ota-onalar! 1-chorak oraliq nazorati bo'yicha yig'ilish o'tkaziladi.", date: "30.09.2026", author: "Sinf rahbari" },
+      { id: 2, title: "🏆 Matematika olimpiadasining maktab bosqichi", text: "Iqtidorli o'quvchilar o'rtasida fan olimpiadasi bo'lib o'tadi.", date: "29.09.2026", author: "Nilufar Azimova" }
+    ];
+
+    const INITIAL_BOOKS = [
+      { id: 1, title: "Algebra 9-sinf", author: "Sh. Alimov", subject: "Matematika", grade: "9-sinf", size: "14 MB", icon: "📐", type: "darslik" },
+      { id: 2, title: "Fizika 9-sinf", author: "P. Qodirov", subject: "Fizika", grade: "9-sinf", size: "18 MB", icon: "⚡", type: "darslik" },
+      { id: 3, title: "O'tkan Kunlar", author: "Abdulla Qodiriy", subject: "Adabiyot", grade: "Barcha sinflar", size: "6 MB", icon: "📖", type: "badiiy" },
+      { id: 4, title: "Boburnoma", author: "Zahiriddin Muhammad Bobur", subject: "Tarix", grade: "Barcha sinflar", size: "9 MB", icon: "👑", type: "badiiy" }
+    ];
+
+    const INITIAL_QUIZ = [
+      { question: "1. Kvadratning tomoni 8 sm bo'lsa, uning yuzi qancha?", options: ["32 sm²", "64 sm²", "16 sm²", "48 sm²"], correct: 1 },
+      { question: "2. Nyutonning birinchi qonuni nima deyiladi?", options: ["Inersiya qonuni", "Tortishish qonuni", "Termodinamika", "Reaksiya"], correct: 0 },
+      { question: "3. 'O'tkan kunlar' romanining bosh qahramoni kim?", options: ["Anvar", "Otabek", "Navoiy", "Bobur"], correct: 1 }
+    ];
+
+    const INITIAL_CAFETERIA = [
+      { day: "Dushanba", breakfast: "Suli yormasi, pishloq, choy", lunch: "Mastava sho'rva, Tovuqli palov, sharbat", calories: "850 kkal" },
+      { day: "Seshanba", breakfast: "Tuxum quymoq, tvorog, kofe", lunch: "Borsh, Go'shtli kotlet pyure bilan, salat", calories: "920 kkal" },
+      { day: "Chorshanba", breakfast: "Manna bo'tqasi, jemli non", lunch: "Chuchvara sho'rva, Qozon kabob, kompot", calories: "950 kkal" }
+    ];
+
+    // LocalStorage orqali yuklash
+    let admins = JSON.parse(localStorage.getItem('edu_admins') || 'null') || INITIAL_ADMINS;
+    let teachers = JSON.parse(localStorage.getItem('edu_teachers') || 'null') || INITIAL_TEACHERS;
+    let students = JSON.parse(localStorage.getItem('edu_students') || 'null') || INITIAL_STUDENTS;
+    let schedule = JSON.parse(localStorage.getItem('edu_schedule') || 'null') || INITIAL_SCHEDULE;
+    let homework = JSON.parse(localStorage.getItem('edu_homework') || 'null') || INITIAL_HOMEWORK;
+    let fund = JSON.parse(localStorage.getItem('edu_fund') || 'null') || INITIAL_FUND;
+    let announcements = JSON.parse(localStorage.getItem('edu_announcements') || 'null') || INITIAL_ANNOUNCEMENTS;
+    let libraryBooks = JSON.parse(localStorage.getItem('edu_books') || 'null') || INITIAL_BOOKS;
+    let quizList = JSON.parse(localStorage.getItem('edu_quiz') || 'null') || INITIAL_QUIZ;
+    let cafeteriaMenu = JSON.parse(localStorage.getItem('edu_cafeteria') || 'null') || INITIAL_CAFETERIA;
+
+    let grades = JSON.parse(localStorage.getItem('edu_grades') || 'null') || {
+      1: { "Matematika": [5, 5, 4], "Ingliz tili": [5, 4, 5], "Fizika": [4, 5, 5] },
+      2: { "Matematika": [4, 5, 4], "Ingliz tili": [5, 5, 5], "Fizika": [4, 4, 5] },
+      3: { "Matematika": [3, 4, 4], "Ingliz tili": [4, 4, 3], "Fizika": [5, 4, 4] },
+      4: { "Matematika": [5, 5, 5], "Ingliz tili": [5, 5, 5], "Fizika": [5, 5, 5] },
+      5: { "Matematika": [4, 3, 4], "Ingliz tili": [3, 4, 4], "Fizika": [4, 4, 3] },
+      6: { "Matematika": [5, 4, 5], "Ingliz tili": [4, 5, 4], "Fizika": [5, 4, 5] }
+    };
+
+    let attendanceRecords = JSON.parse(localStorage.getItem('edu_attendance') || 'null');
+    if (!attendanceRecords) {
+      const today = new Date().toISOString().split('T')[0];
+      attendanceRecords = {
+        [today]: { 1: 'present', 2: 'present', 3: 'absent', 4: 'present', 5: 'present', 6: 'present' }
+      };
+    }
+
+    let linkedCodes = JSON.parse(localStorage.getItem('edu_linked_codes') || '["WXR58P", "5JHBTJ"]');
+    let currentScheduleDay = 'dushanba';
+    let userAnswers = {};
+
+    function saveAll() {
+      localStorage.setItem('edu_admins', JSON.stringify(admins));
+      localStorage.setItem('edu_teachers', JSON.stringify(teachers));
+      localStorage.setItem('edu_students', JSON.stringify(students));
+      localStorage.setItem('edu_schedule', JSON.stringify(schedule));
+      localStorage.setItem('edu_homework', JSON.stringify(homework));
+      localStorage.setItem('edu_fund', JSON.stringify(fund));
+      localStorage.setItem('edu_announcements', JSON.stringify(announcements));
+      localStorage.setItem('edu_books', JSON.stringify(libraryBooks));
+      localStorage.setItem('edu_quiz', JSON.stringify(quizList));
+      localStorage.setItem('edu_cafeteria', JSON.stringify(cafeteriaMenu));
+      localStorage.setItem('edu_grades', JSON.stringify(grades));
+      localStorage.setItem('edu_attendance', JSON.stringify(attendanceRecords));
+      localStorage.setItem('edu_linked_codes', JSON.stringify(linkedCodes));
+    }
+
+    // Modal Confirmation for Safe Deletion (Works on all mobile and Telegram WebApp!)
+    let pendingDeleteAction = null;
+    function confirmDelete(titleText, onConfirmCallback) {
+      document.getElementById('deleteConfirmText').innerText = titleText;
+      const btn = document.getElementById('deleteConfirmActionBtn');
+      btn.onclick = function() {
+        closeModal('deleteConfirmModal');
+        onConfirmCallback();
+      };
+      openModal('deleteConfirmModal');
+    }
+
+    // 1. Tungi/Kunduzgi rejim
+    function initTheme() {
+      const isDark = localStorage.getItem('edu_dark_mode') === 'true';
+      if (isDark) {
+        document.documentElement.classList.add('dark');
+        document.getElementById('themeIcon').className = 'fa-solid fa-sun text-amber-400';
+      } else {
+        document.documentElement.classList.remove('dark');
+        document.getElementById('themeIcon').className = 'fa-solid fa-moon text-amber-300';
+      }
+    }
+
+    function toggleDarkMode() {
+      const isDark = document.documentElement.classList.toggle('dark');
+      localStorage.setItem('edu_dark_mode', isDark);
+      document.getElementById('themeIcon').className = isDark ? 'fa-solid fa-sun text-amber-400' : 'fa-solid fa-moon text-amber-300';
+    }
+
+    // 2. Jonli Soat & Zvonok taymeri
+    function updateLiveClock() {
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0];
+      const clockEl = document.getElementById('liveClock');
+      if (clockEl) clockEl.innerText = timeStr;
+
+      const hours = now.getHours();
+      const minutes = now.getMinutes();
+      const currentMin = hours * 60 + minutes;
+
+      const lessons = [
+        { name: "1-dars: Matematika", start: 8*60+30, end: 9*60+15, teacher: "Nilufar Azimova (302-xona)" },
+        { name: "2-dars: Ona tili", start: 9*60+25, end: 10*60+10, teacher: "Sherzod Rahimov (205-xona)" },
+        { name: "3-dars: Ingliz tili", start: 10*60+30, end: 11*60+15, teacher: "Zuhra Qodirova (108-xona)" },
+        { name: "4-dars: Fizika", start: 11*60+25, end: 12*60+10, teacher: "Davron Aliyev (401-laboratoriya)" }
+      ];
+
+      let activeLesson = null;
+      let nextBreak = "Darslar yakunlangan";
+
+      for (const l of lessons) {
+        if (currentMin >= l.start && currentMin < l.end) {
+          activeLesson = l;
+          nextBreak = (l.end - currentMin) + " daqiqadan so'ng tanaffus";
+          break;
+        } else if (currentMin < l.start) {
+          nextBreak = (l.start - currentMin) + " daqiqadan so'ng " + l.name;
+          break;
+        }
+      }
+
+      const subEl = document.getElementById('currentLessonSubject');
+      const timeEl = document.getElementById('currentLessonTime');
+      const teachEl = document.getElementById('currentLessonTeacher');
+      const breakEl = document.getElementById('nextBreakTime');
+
+      if (activeLesson) {
+        if (subEl) subEl.innerText = activeLesson.name;
+        if (timeEl) timeEl.innerText = "Hozir davom etmoqda";
+        if (teachEl) teachEl.innerText = activeLesson.teacher;
+      } else {
+        if (subEl) subEl.innerText = "Tanaffus yoki Dam olish vaqti";
+        if (timeEl) timeEl.innerText = "Darslar jadvali bo'yicha tanaffus";
+        if (teachEl) teachEl.innerText = "Sinf xonasi";
+      }
+      if (breakEl) breakEl.innerText = nextBreak;
+    }
+    setInterval(updateLiveClock, 1000);
+
+    // 3. Tablarni almashtirish
+    const ALL_TABS = ['dashboard', 'davomat', 'grades', 'students', 'teachers', 'admins', 'homework', 'schedule', 'library', 'quiz', 'fund', 'cafeteria', 'calendar', 'announcements', 'parent'];
+
+    function switchTab(name) {
+      ALL_TABS.forEach(t => {
+        const el = document.getElementById('tab' + t.charAt(0).toUpperCase() + t.slice(1));
+        const btn = document.getElementById('tabBtn' + t.charAt(0).toUpperCase() + t.slice(1));
+        if (el) el.classList.add('hidden');
+        if (btn) {
+          btn.classList.remove('border-amber-400', 'text-amber-300');
+          btn.classList.add('border-transparent', 'text-indigo-200');
+        }
+      });
+
+      const activeEl = document.getElementById('tab' + name.charAt(0).toUpperCase() + name.slice(1));
+      const activeBtn = document.getElementById('tabBtn' + name.charAt(0).toUpperCase() + name.slice(1));
+      if (activeEl) activeEl.classList.remove('hidden');
+      if (activeBtn) {
+        activeBtn.classList.remove('border-transparent', 'text-indigo-200');
+        activeBtn.classList.add('border-amber-400', 'text-amber-300');
+      }
+
+      if (name === 'dashboard') renderDashboard();
+      if (name === 'davomat') loadAttendanceForDate();
+      if (name === 'grades') renderGradesTable();
+      if (name === 'students') renderStudentsTable();
+      if (name === 'teachers') renderTeachers();
+      if (name === 'admins') renderAdmins();
+      if (name === 'homework') renderHomework();
+      if (name === 'schedule') renderSchedule();
+      if (name === 'library') renderLibrary();
+      if (name === 'quiz') renderQuiz();
+      if (name === 'fund') renderFund();
+      if (name === 'cafeteria') renderCafeteria();
+      if (name === 'announcements') renderAnnouncements();
+      if (name === 'parent') renderParentPortal();
+    }
+
+    // 4. Dashboard
+    function renderDashboard() {
+      document.getElementById('dashTotalStudents').innerText = students.length;
+      document.getElementById('dashTotalTeachers').innerText = teachers.length;
+      document.getElementById('dashTotalAdmins').innerText = admins.length;
+
+      const today = new Date().toISOString().split('T')[0];
+      const todayLabel = new Date().toLocaleDateString('uz-UZ', { day: 'numeric', month: 'long', year: 'numeric' });
+      document.getElementById('dashTodayDateLabel').innerText = todayLabel;
+
+      const rec = attendanceRecords[today] || {};
+      let pCount = 0, aCount = 0, eCount = 0;
+      students.forEach(s => {
+        const st = rec[s.id] || 'present';
+        if (st === 'present') pCount++;
+        else if (st === 'absent') aCount++;
+        else if (st === 'excused') eCount++;
+      });
+
+      document.getElementById('dashTodayPresent').innerText = pCount;
+      document.getElementById('dashTodayAbsent').innerText = aCount;
+      document.getElementById('dashTodayExcused').innerText = eCount;
+
+      const totalToday = students.length || 1;
+      const todayPct = Math.round((pCount / totalToday) * 100);
+      document.getElementById('dashTodayPercent').innerText = todayPct + '%';
+      document.getElementById('dashTodayProgressBar').style.width = todayPct + '%';
+
+      let totalDays = 0, totalP = 0;
+      for (const d in attendanceRecords) {
+        for (const sid in attendanceRecords[d]) {
+          totalDays++;
+          if (attendanceRecords[d][sid] === 'present') totalP++;
+        }
+      }
+      const overallAvg = totalDays > 0 ? Math.round((totalP / totalDays) * 100) : 100;
+      document.getElementById('dashAvgAttendance').innerText = overallAvg + '%';
+
+      let inc = 0, exp = 0;
+      fund.forEach(f => {
+        if (f.type === 'income') inc += f.amount;
+        else exp += f.amount;
+      });
+      document.getElementById('dashFundBalance').innerText = (inc - exp).toLocaleString('uz-UZ') + " so'm";
+
+      // Top O'quvchilar
+      const topContainer = document.getElementById('topStudentsList');
+      topContainer.innerHTML = '';
+      const studentGpas = students.map(s => {
+        return { ...s, gpa: parseFloat(getStudentAverageGrade(s.id)) };
+      }).sort((a, b) => b.gpa - a.gpa).slice(0, 4);
+
+      const medals = ['🥇', '🥈', '🥉', '⭐'];
+      studentGpas.forEach((s, idx) => {
+        const row = document.createElement('div');
+        row.className = 'flex items-center justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700/60 transition cursor-pointer';
+        row.onclick = () => openStudentProfile(s.id);
+        row.innerHTML = `
+          <div class="flex items-center space-x-3">
+            <span class="text-base">${medals[idx]}</span>
+            <div>
+              <div class="font-bold text-xs text-slate-800 dark:text-white">${s.full_name}</div>
+              <div class="text-[10px] text-slate-400 font-mono">${s.student_code}</div>
+            </div>
+          </div>
+          <span class="px-2 py-0.5 rounded-lg text-xs font-black bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300">${s.gpa} GPA</span>
+        `;
+        topContainer.appendChild(row);
+      });
+
+      // Dashboard Admins
+      const adminsContainer = document.getElementById('dashAdminsList');
+      adminsContainer.innerHTML = '';
+      admins.slice(0, 3).forEach(adm => {
+        const row = document.createElement('div');
+        row.className = 'flex items-center justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800';
+        row.innerHTML = `
+          <div class="flex items-center space-x-3">
+            <span class="text-lg">${adm.avatar || '👨‍💼'}</span>
+            <div>
+              <div class="font-bold text-xs text-slate-800 dark:text-white">${adm.full_name}</div>
+              <div class="text-[10px] text-rose-600 dark:text-rose-400 font-semibold">${adm.role}</div>
+            </div>
+          </div>
+          <a href="tel:${adm.phone}" class="px-2 py-1 rounded bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 text-xs font-bold"><i class="fa-solid fa-phone"></i></a>
+        `;
+        adminsContainer.appendChild(row);
+      });
+    }
+
+    // 5. O'quvchilar boshqaruvi
+    function renderStudentsTable() {
+      const tbody = document.getElementById('studentsTableBody');
+      tbody.innerHTML = '';
+
+      students.forEach((s, idx) => {
+        const stats = getStudentStats(s.id);
+        const gpa = getStudentAverageGrade(s.id);
+
+        const tr = document.createElement('tr');
+        tr.className = 'hover:bg-slate-50 dark:hover:bg-slate-800/40 transition cursor-pointer';
+        tr.onclick = () => openStudentProfile(s.id);
+        tr.innerHTML = `
+          <td class="px-4 py-3 font-semibold text-slate-400">${idx + 1}</td>
+          <td class="px-4 py-3 font-bold text-slate-800 dark:text-white hover:text-indigo-600 dark:hover:text-indigo-400">
+            ${s.full_name}
+            <div class="text-[10px] text-slate-400 font-normal"><i class="fa-solid fa-phone text-[9px]"></i> ${s.phone || 'Telefon yo'q'}</div>
+          </td>
+          <td class="px-4 py-3">
+            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-bold bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300">
+              ${s.student_code}
+            </span>
+          </td>
+          <td class="px-4 py-3 text-center">
+            <span class="font-bold text-slate-700 dark:text-slate-300">${stats.percent}%</span>
+          </td>
+          <td class="px-4 py-3 text-center">
+            <span class="font-black text-amber-500 bg-amber-50 dark:bg-amber-950 px-2 py-0.5 rounded-lg text-xs">${gpa} ⭐</span>
+          </td>
+          <td class="px-4 py-3 text-right">
+            <button onclick="event.stopPropagation(); deleteStudentAction(${s.id}, '${s.full_name}')" class="w-8 h-8 rounded-lg bg-rose-50 hover:bg-rose-600 hover:text-white text-rose-600 text-xs transition inline-flex items-center justify-center" title="O'chirish">
+              <i class="fa-solid fa-trash-can"></i>
+            </button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function handleAddNewStudent(e) {
+      e.preventDefault();
+      const name = document.getElementById('newStudentFullName').value.trim();
+      const phone = document.getElementById('newStudentPhone').value.trim() || "+998 90 000 00 00";
+      const parent = document.getElementById('newStudentParent').value.trim() || "Ota-onasi";
+      if (!name) return;
+
+      const code = generateStudentCode();
+      const newId = students.length > 0 ? Math.max(...students.map(s => s.id)) + 1 : 1;
+      students.push({ id: newId, full_name: name, student_code: code, phone: phone, parent_name: parent });
+      saveAll();
+      closeModal('addStudentModal');
+      renderStudentsTable();
+      renderDashboard();
+      document.getElementById('newStudentFullName').value = '';
+      alert(`✅ O'quvchi ${name} muvaffaqiyatli qo'shildi! ID Kodi: ${code}`);
+    }
+
+    function deleteStudentAction(id, name) {
+      confirmDelete(`"${name}" o'quvchisini tizimdan o'chirishni tasdiqlaysizmi?`, () => {
+        students = students.filter(s => s.id !== id);
+        saveAll();
+        renderStudentsTable();
+        renderDashboard();
+      });
+    }
+
+    // 6. Ustozlar boshqaruvi
+    function renderTeachers() {
+      const grid = document.getElementById('teachersGrid');
+      grid.innerHTML = '';
+
+      teachers.forEach(t => {
+        const card = document.createElement('div');
+        card.className = 'bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4 hover:shadow-md transition';
+        card.innerHTML = `
+          <div class="flex items-center space-x-3">
+            <div class="w-12 h-12 rounded-2xl bg-emerald-50 dark:bg-emerald-950 text-2xl flex items-center justify-center border border-emerald-100 dark:border-emerald-900">
+              ${t.avatar || '👨‍🏫'}
+            </div>
+            <div>
+              <h3 class="font-extrabold text-sm text-slate-800 dark:text-white">${t.full_name}</h3>
+              <p class="text-xs font-semibold text-emerald-600 dark:text-emerald-400">${t.subject}</p>
+            </div>
+          </div>
+          <div class="space-y-1.5 text-xs text-slate-500 dark:text-slate-400">
+            <div class="flex items-center space-x-2"><i class="fa-solid fa-phone text-slate-400 w-4"></i> <span>${t.phone}</span></div>
+            <div class="flex items-center space-x-2"><i class="fa-solid fa-door-open text-slate-400 w-4"></i> <span>${t.room || 'Xona ko'rsatilmagan'}</span></div>
+          </div>
+          <div class="pt-2 border-t border-slate-100 dark:border-slate-800 flex justify-between items-center">
+            <a href="tel:${t.phone}" class="px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300 text-xs font-bold transition flex items-center space-x-1.5">
+              <i class="fa-solid fa-phone"></i>
+              <span>Qo'ng'iroq</span>
+            </a>
+            <button onclick="deleteTeacherAction(${t.id}, '${t.full_name}')" class="w-8 h-8 rounded-lg bg-rose-50 hover:bg-rose-600 hover:text-white text-rose-600 text-xs transition inline-flex items-center justify-center" title="O'chirish">
+              <i class="fa-solid fa-trash-can"></i>
+            </button>
+          </div>
+        `;
+        grid.appendChild(card);
+      });
+    }
+
+    function handleAddNewTeacher(e) {
+      e.preventDefault();
+      const name = document.getElementById('teacherFullName').value.trim();
+      const sub = document.getElementById('teacherSubject').value.trim();
+      const phone = document.getElementById('teacherPhone').value.trim();
+      const room = document.getElementById('teacherRoom').value.trim();
+      const newId = teachers.length > 0 ? Math.max(...teachers.map(t => t.id)) + 1 : 1;
+
+      teachers.push({ id: newId, full_name: name, subject: sub, phone: phone, room: room, avatar: "👨‍🏫" });
+      saveAll();
+      closeModal('addTeacherModal');
+      renderTeachers();
+      renderDashboard();
+      document.getElementById('teacherFullName').value = '';
+      alert(`✅ Ustoz ${name} muvaffaqiyatli qo'shildi!`);
+    }
+
+    function deleteTeacherAction(id, name) {
+      confirmDelete(`"${name}" o'qituvchisini o'chirishni tasdiqlaysizmi?`, () => {
+        teachers = teachers.filter(t => t.id !== id);
+        saveAll();
+        renderTeachers();
+        renderDashboard();
+      });
+    }
+
+    // 7. Adminlar boshqaruvi (YANGI FUNKSIYA)
+    function renderAdmins() {
+      const grid = document.getElementById('adminsGrid');
+      grid.innerHTML = '';
+
+      admins.forEach(a => {
+        const card = document.createElement('div');
+        card.className = 'bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-4 hover:shadow-md transition';
+        card.innerHTML = `
+          <div class="flex items-center space-x-3">
+            <div class="w-12 h-12 rounded-2xl bg-rose-50 dark:bg-rose-950 text-2xl flex items-center justify-center border border-rose-100 dark:border-rose-900">
+              ${a.avatar || '👨‍💼'}
+            </div>
+            <div>
+              <h3 class="font-extrabold text-sm text-slate-800 dark:text-white">${a.full_name}</h3>
+              <p class="text-xs font-semibold text-rose-600 dark:text-rose-400">${a.role}</p>
+            </div>
+          </div>
+          <div class="space-y-1.5 text-xs text-slate-500 dark:text-slate-400">
+            <div class="flex items-center space-x-2"><i class="fa-solid fa-phone text-slate-400 w-4"></i> <span>${a.phone || 'Telefon yo'q'}</span></div>
+            <div class="flex items-center space-x-2"><i class="fa-brands fa-telegram text-sky-500 w-4"></i> <span class="font-mono text-[11px]">ID: ${a.telegram_id || 'Belgilanmagan'}</span></div>
+          </div>
+          <div class="pt-2 border-t border-slate-100 dark:border-slate-800 flex justify-between items-center">
+            <a href="tel:${a.phone}" class="px-3 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-300 text-xs font-bold transition flex items-center space-x-1.5">
+              <i class="fa-solid fa-phone"></i>
+              <span>Aloqa</span>
+            </a>
+            <button onclick="deleteAdminAction(${a.id}, '${a.full_name}')" class="w-8 h-8 rounded-lg bg-rose-50 hover:bg-rose-600 hover:text-white text-rose-600 text-xs transition inline-flex items-center justify-center" title="O'chirish">
+              <i class="fa-solid fa-trash-can"></i>
+            </button>
+          </div>
+        `;
+        grid.appendChild(card);
+      });
+    }
+
+    function handleAddNewAdmin(e) {
+      e.preventDefault();
+      const name = document.getElementById('adminFullName').value.trim();
+      const role = document.getElementById('adminRole').value;
+      const tgId = document.getElementById('adminTelegramId').value.trim();
+      const phone = document.getElementById('adminPhone').value.trim();
+      const newId = admins.length > 0 ? Math.max(...admins.map(a => a.id)) + 1 : 1;
+
+      admins.push({ id: newId, full_name: name, role: role, telegram_id: tgId, phone: phone, avatar: "👨‍💼" });
+      saveAll();
+      closeModal('addAdminModal');
+      renderAdmins();
+      renderDashboard();
+      document.getElementById('adminFullName').value = '';
+      alert(`✅ Admin ${name} (${role}) muvaffaqiyatli qo'shildi!`);
+    }
+
+    function deleteAdminAction(id, name) {
+      confirmDelete(`"${name}" adminini o'chirishni tasdiqlaysizmi?`, () => {
+        admins = admins.filter(a => a.id !== id);
+        saveAll();
+        renderAdmins();
+        renderDashboard();
+      });
+    }
+
+    // 8. Davomat olish
+    function loadAttendanceForDate() {
+      const input = document.getElementById('attendanceDateInput');
+      if (!input.value) {
+        input.value = new Date().toISOString().split('T')[0];
+      }
+      const dateVal = input.value;
+      if (!attendanceRecords[dateVal]) {
+        attendanceRecords[dateVal] = {};
+        students.forEach(s => attendanceRecords[dateVal][s.id] = 'present');
+        saveAll();
+      }
+
+      const tbody = document.getElementById('attendanceTableBody');
+      tbody.innerHTML = '';
+
+      students.forEach((s, idx) => {
+        const currentStatus = attendanceRecords[dateVal][s.id] || 'present';
+        const tr = document.createElement('tr');
+        tr.className = 'hover:bg-slate-50 dark:hover:bg-slate-800/40 transition';
+        tr.innerHTML = `
+          <td class="px-4 py-3 font-semibold text-slate-400">${idx + 1}</td>
+          <td class="px-4 py-3 font-bold text-slate-800 dark:text-white hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer" onclick="openStudentProfile(${s.id})">
+            ${s.full_name}
+          </td>
+          <td class="px-4 py-3 font-mono text-xs font-bold text-indigo-600 dark:text-indigo-400">${s.student_code}</td>
+          <td class="px-4 py-3 text-center">
+            <div class="inline-flex p-1 bg-slate-100 dark:bg-slate-800 rounded-xl space-x-1">
+              <button onclick="setAttendanceStatus(${s.id}, 'present')" class="px-3 py-1 rounded-lg text-xs font-bold transition ${currentStatus === 'present' ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'}">🟢 Bor</button>
+              <button onclick="setAttendanceStatus(${s.id}, 'absent')" class="px-3 py-1 rounded-lg text-xs font-bold transition ${currentStatus === 'absent' ? 'bg-rose-600 text-white shadow-sm' : 'text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'}">🔴 Yo'q</button>
+              <button onclick="setAttendanceStatus(${s.id}, 'excused')" class="px-3 py-1 rounded-lg text-xs font-bold transition ${currentStatus === 'excused' ? 'bg-amber-500 text-white shadow-sm' : 'text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'}">🟡 Sababli</button>
+            </div>
+          </td>
+          <td class="px-4 py-3 text-right">
+            <a href="tel:${s.phone || ''}" class="text-indigo-600 dark:text-indigo-400 hover:underline text-xs font-semibold mr-2"><i class="fa-solid fa-phone"></i></a>
+            <button onclick="openStudentProfile(${s.id})" class="text-slate-400 hover:text-indigo-600 text-xs"><i class="fa-solid fa-circle-info"></i></button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function setAttendanceStatus(sid, val) {
+      const dateVal = document.getElementById('attendanceDateInput').value;
+      if (!attendanceRecords[dateVal]) attendanceRecords[dateVal] = {};
+      attendanceRecords[dateVal][sid] = val;
+      saveAll();
+      loadAttendanceForDate();
+      renderDashboard();
+    }
+
+    function setAllAttendance(val) {
+      const dateVal = document.getElementById('attendanceDateInput').value;
+      if (!attendanceRecords[dateVal]) attendanceRecords[dateVal] = {};
+      students.forEach(s => attendanceRecords[dateVal][s.id] = val);
+      saveAll();
+      loadAttendanceForDate();
+      renderDashboard();
+    }
+
+    function saveAttendanceToast() {
+      saveAll();
+      alert("✅ Davomat muvaffaqiyatli saqlandi!");
+    }
+
+    function shareAttendanceTelegram() {
+      const today = new Date().toISOString().split('T')[0];
+      const rec = attendanceRecords[today] || {};
+      let absentList = [];
+      students.forEach(s => {
+        if (rec[s.id] === 'absent') absentList.push(s.full_name);
+      });
+
+      let text = `📊 EDU MEMORY — KUNLIK DAVOMAT HISOBOTI\n📅 Sana: ${today}\n\n`;
+      text += `🟢 Darsda bor: ${document.getElementById('dashTodayPresent').innerText} nafar\n`;
+      text += `🔴 Darsda yo'q: ${document.getElementById('dashTodayAbsent').innerText} nafar\n`;
+      text += `🟡 Sababli: ${document.getElementById('dashTodayExcused').innerText} nafar\n\n`;
+      if (absentList.length > 0) {
+        text += `⚠️ Darsga kelmaganlar:\n` + absentList.map((n, i) => `${i+1}. ${n}`).join('\n');
+      } else {
+        text += `🎉 Barcha o'quvchilar darsda to'liq ishtirok etmoqda!`;
+      }
+
+      navigator.clipboard.writeText(text).then(() => {
+        alert("📋 Telegram xabarnoma nusxalandi! Telegram guruhiga joylashingiz mumkin.");
+      });
+    }
+
+    // 9. Baholar Jurnali
+    function populateSubjects() {
+      const select = document.getElementById('gradesSubjectSelect');
+      const hwSelect = document.getElementById('hwSubject');
+      if (!select) return;
+      select.innerHTML = '';
+      if (hwSelect) hwSelect.innerHTML = '';
+
+      const subjects = ["Matematika", "Ona tili", "Ingliz tili", "Fizika", "Kimyo", "Biologiya", "Informatika"];
+      subjects.forEach(sub => {
+        const opt = document.createElement('option');
+        opt.value = sub;
+        opt.innerText = sub;
+        select.appendChild(opt);
+
+        if (hwSelect) {
+          const opt2 = document.createElement('option');
+          opt2.value = sub;
+          opt2.innerText = sub;
+          hwSelect.appendChild(opt2);
+        }
+      });
+    }
+
+    function renderGradesTable() {
+      const subject = document.getElementById('gradesSubjectSelect').value || "Matematika";
+      const tbody = document.getElementById('gradesTableBody');
+      tbody.innerHTML = '';
+
+      students.forEach((s, idx) => {
+        if (!grades[s.id]) grades[s.id] = {};
+        if (!grades[s.id][subject]) grades[s.id][subject] = [];
+
+        const studentGrades = grades[s.id][subject];
+        const sum = studentGrades.reduce((a, b) => a + b, 0);
+        const avg = studentGrades.length > 0 ? (sum / studentGrades.length).toFixed(1) : '-';
+
+        const tr = document.createElement('tr');
+        tr.className = 'hover:bg-slate-50 dark:hover:bg-slate-800/40 transition';
+        tr.innerHTML = `
+          <td class="px-4 py-3 font-semibold text-slate-400">${idx + 1}</td>
+          <td class="px-4 py-3 font-bold text-slate-800 dark:text-white hover:text-indigo-600 dark:hover:text-indigo-400 cursor-pointer" onclick="openStudentProfile(${s.id})">
+            ${s.full_name}
+          </td>
+          <td class="px-4 py-3">
+            <div class="flex items-center space-x-1.5 flex-wrap gap-1">
+              ${studentGrades.map(g => `
+                <span class="inline-flex items-center justify-center w-7 h-7 rounded-lg text-xs font-black ${g === 5 ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300' : g === 4 ? 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'}">
+                  ${g}
+                </span>
+              `).join('') || '<span class="text-xs text-slate-400">Baholar yo'q</span>'}
+            </div>
+          </td>
+          <td class="px-4 py-3 text-center">
+            <span class="px-2.5 py-1 rounded-xl text-xs font-black ${avg >= 4.5 ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300'}">${avg}</span>
+          </td>
+          <td class="px-4 py-3 text-right">
+            <div class="inline-flex space-x-1">
+              <button onclick="addGrade(${s.id}, '${subject}', 5)" class="w-7 h-7 rounded-lg bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 font-black hover:bg-emerald-600 hover:text-white transition text-xs">5</button>
+              <button onclick="addGrade(${s.id}, '${subject}', 4)" class="w-7 h-7 rounded-lg bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300 font-black hover:bg-blue-600 hover:text-white transition text-xs">4</button>
+              <button onclick="addGrade(${s.id}, '${subject}', 3)" class="w-7 h-7 rounded-lg bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300 font-black hover:bg-amber-600 hover:text-white transition text-xs">3</button>
+            </div>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function addGrade(studentId, subject, val) {
+      if (!grades[studentId]) grades[studentId] = {};
+      if (!grades[studentId][subject]) grades[studentId][subject] = [];
+      grades[studentId][subject].push(val);
+      saveAll();
+      renderGradesTable();
+      renderDashboard();
+    }
+
+    // 10. Uyga vazifalar
+    function renderHomework() {
+      const container = document.getElementById('homeworkList');
+      container.innerHTML = '';
+
+      homework.forEach(hw => {
+        const card = document.createElement('div');
+        card.className = 'bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-3 flex flex-col justify-between';
+        card.innerHTML = `
+          <div>
+            <div class="flex justify-between items-start">
+              <span class="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300">
+                ${hw.subject}
+              </span>
+              <button onclick="deleteHomeworkAction(${hw.id})" class="w-7 h-7 rounded-lg bg-rose-50 text-rose-600 hover:bg-rose-600 hover:text-white transition flex items-center justify-center text-xs"><i class="fa-solid fa-trash-can"></i></button>
+            </div>
+            <p class="text-sm font-semibold text-slate-800 dark:text-slate-100 mt-2">${hw.task}</p>
+          </div>
+          <div class="pt-2 border-t border-slate-100 dark:border-slate-800 flex justify-between items-center text-xs">
+            <span class="text-slate-400"><i class="fa-regular fa-clock mr-1"></i> ${hw.dueDate}</span>
+            <span class="text-emerald-600 font-bold"><i class="fa-solid fa-circle-check"></i> Faol topshiriq</span>
+          </div>
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    function handleAddNewHomework(e) {
+      e.preventDefault();
+      const sub = document.getElementById('hwSubject').value;
+      const task = document.getElementById('hwTask').value.trim();
+      const date = document.getElementById('hwDueDate').value;
+      const newId = homework.length > 0 ? Math.max(...homework.map(h => h.id)) + 1 : 1;
+
+      homework.unshift({ id: newId, subject: sub, task: task, dueDate: date, status: 'active' });
+      saveAll();
+      closeModal('addHomeworkModal');
+      renderHomework();
+      document.getElementById('hwTask').value = '';
+    }
+
+    function deleteHomeworkAction(id) {
+      confirmDelete("Ushbu topshiriqni o'chirishni tasdiqlaysizmi?", () => {
+        homework = homework.filter(h => h.id !== id);
+        saveAll();
+        renderHomework();
+      });
+    }
+
+    // 11. Dars jadvali
+    function selectScheduleDay(day) {
+      currentScheduleDay = day;
+      document.querySelectorAll('.schedule-day-btn').forEach(b => {
+        if (b.getAttribute('data-day') === day) {
+          b.className = 'schedule-day-btn px-4 py-2 rounded-xl text-xs font-bold transition bg-indigo-600 text-white shadow-sm';
+        } else {
+          b.className = 'schedule-day-btn px-4 py-2 rounded-xl text-xs font-bold transition text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800';
+        }
+      });
+      renderSchedule();
+    }
+
+    function renderSchedule() {
+      const container = document.getElementById('scheduleItemsContainer');
+      container.innerHTML = '';
+      const dayList = schedule[currentScheduleDay] || [];
+
+      if (dayList.length === 0) {
+        container.innerHTML = `<div class="p-6 text-center text-xs text-slate-400">Bu kunda darslar belgilanmagan.</div>`;
+        return;
+      }
+
+      dayList.forEach((item, idx) => {
+        const div = document.createElement('div');
+        div.className = 'py-3.5 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800/40 transition';
+        div.innerHTML = `
+          <div class="flex items-center space-x-3.5">
+            <div class="w-9 h-9 rounded-xl bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 font-extrabold flex items-center justify-center text-xs border border-indigo-100 dark:border-indigo-900">
+              ${idx + 1}
+            </div>
+            <div>
+              <div class="font-extrabold text-sm text-slate-800 dark:text-white">${item.subject}</div>
+              <div class="text-xs text-slate-400 flex items-center space-x-2">
+                <span><i class="fa-solid fa-chalkboard-user mr-1"></i> ${item.teacher}</span>
+                <span>•</span>
+                <span><i class="fa-solid fa-location-dot mr-1"></i> ${item.room}</span>
+              </div>
+            </div>
+          </div>
+          <span class="px-3 py-1 rounded-xl text-xs font-mono font-bold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+            ${item.time}
+          </span>
+        `;
+        container.appendChild(div);
+      });
+    }
+
+    // 12. Kutubxona
+    function renderLibrary() {
+      const filter = document.getElementById('libraryFilter').value;
+      const grid = document.getElementById('libraryGrid');
+      grid.innerHTML = '';
+
+      const list = filter === 'all' ? libraryBooks : libraryBooks.filter(b => b.type === filter);
+      list.forEach(book => {
+        const card = document.createElement('div');
+        card.className = 'bg-white dark:bg-slate-900 rounded-2xl p-4 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-3 flex flex-col justify-between hover:shadow-md transition';
+        card.innerHTML = `
+          <div>
+            <div class="w-10 h-10 rounded-xl bg-amber-50 dark:bg-amber-950 text-2xl flex items-center justify-center mb-2">
+              ${book.icon}
+            </div>
+            <h4 class="font-extrabold text-sm text-slate-800 dark:text-white">${book.title}</h4>
+            <p class="text-xs text-slate-400 font-medium">${book.author}</p>
+            <div class="flex items-center space-x-2 mt-2">
+              <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">${book.grade}</span>
+              <span class="text-[10px] text-slate-400">${book.size}</span>
+            </div>
+          </div>
+          <button onclick="alert('📖 ${book.title} elektron kitobi yuklab olindi!')" class="w-full py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 text-xs font-bold transition flex items-center justify-center space-x-1">
+            <i class="fa-solid fa-download"></i>
+            <span>Yuklab olish</span>
+          </button>
+        `;
+        grid.appendChild(card);
+      });
+    }
+
+    // 13. Test & Quiz
+    function renderQuiz() {
+      const container = document.getElementById('quizContainer');
+      const resultBox = document.getElementById('quizResult');
+      resultBox.classList.add('hidden');
+      container.classList.remove('hidden');
+      container.innerHTML = '';
+
+      quizList.forEach((q, qIdx) => {
+        const box = document.createElement('div');
+        box.className = 'p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-100 dark:border-slate-800 space-y-3';
+        box.innerHTML = `
+          <h4 class="font-extrabold text-sm text-slate-800 dark:text-white">${q.question}</h4>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            ${q.options.map((opt, optIdx) => `
+              <button onclick="selectQuizAnswer(${qIdx}, ${optIdx})" id="quizBtn_${qIdx}_${optIdx}" class="p-2.5 rounded-xl text-left text-xs font-bold border transition ${userAnswers[qIdx] === optIdx ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300'}">
+                ${String.fromCharCode(65 + optIdx)}) ${opt}
+              </button>
+            `).join('')}
+          </div>
+        `;
+        container.appendChild(box);
+      });
+
+      const finishBtn = document.createElement('button');
+      finishBtn.className = 'w-full py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-sm transition shadow-lg';
+      finishBtn.innerText = "Natijani Tekshirish va Baholash";
+      finishBtn.onclick = submitQuiz;
+      container.appendChild(finishBtn);
+    }
+
+    function selectQuizAnswer(qIdx, optIdx) {
+      userAnswers[qIdx] = optIdx;
+      quizList[qIdx].options.forEach((_, i) => {
+        const btn = document.getElementById(`quizBtn_${qIdx}_${i}`);
+        if (btn) {
+          btn.className = (i === optIdx) 
+            ? 'p-2.5 rounded-xl text-left text-xs font-bold border transition bg-indigo-600 text-white border-indigo-600'
+            : 'p-2.5 rounded-xl text-left text-xs font-bold border transition bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300';
+        }
+      });
+    }
+
+    function submitQuiz() {
+      let correctCount = 0;
+      quizList.forEach((q, i) => {
+        if (userAnswers[i] === q.correct) correctCount++;
+      });
+      const pct = Math.round((correctCount / quizList.length) * 100);
+      document.getElementById('quizScoreText').innerText = `Siz ${quizList.length} ta savoldan ${correctCount} tasiga to'g'ri javob berdingiz (${pct}%)`;
+
+      document.getElementById('quizContainer').classList.add('hidden');
+      document.getElementById('quizResult').classList.remove('hidden');
+    }
+
+    function restartQuiz() {
+      userAnswers = {};
+      renderQuiz();
+    }
+
+    // 14. Sinf Fondi
+    function renderFund() {
+      let inc = 0, exp = 0;
+      fund.forEach(f => {
+        if (f.type === 'income') inc += f.amount;
+        else exp += f.amount;
+      });
+      const bal = inc - exp;
+
+      document.getElementById('fundCardBalance').innerText = bal.toLocaleString('uz-UZ') + " so'm";
+      document.getElementById('fundCardIncome').innerText = "+" + inc.toLocaleString('uz-UZ') + " so'm";
+      document.getElementById('fundCardExpense').innerText = "-" + exp.toLocaleString('uz-UZ') + " so'm";
+
+      const list = document.getElementById('fundTransactionsList');
+      list.innerHTML = '';
+
+      fund.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'py-3.5 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800/40 transition';
+        row.innerHTML = `
+          <div class="flex items-center space-x-3">
+            <div class="w-9 h-9 rounded-xl ${item.type === 'income' ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950 dark:text-emerald-400' : 'bg-rose-50 text-rose-600 dark:bg-rose-950 dark:text-rose-400'} flex items-center justify-center text-sm">
+              <i class="fa-solid ${item.type === 'income' ? 'fa-arrow-down' : 'fa-arrow-up'}"></i>
+            </div>
+            <div>
+              <div class="font-bold text-xs text-slate-800 dark:text-white">${item.desc}</div>
+              <div class="text-[10px] text-slate-400">${item.date}</div>
+            </div>
+          </div>
+          <span class="font-black text-xs ${item.type === 'income' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}">
+            ${item.type === 'income' ? '+' : '-'}${item.amount.toLocaleString('uz-UZ')} so'm
+          </span>
+        `;
+        list.appendChild(row);
+      });
+    }
+
+    function handleAddNewFund(e) {
+      e.preventDefault();
+      const type = document.getElementById('fundType').value;
+      const desc = document.getElementById('fundDesc').value.trim();
+      const amount = parseInt(document.getElementById('fundAmount').value, 10);
+      const today = new Date().toLocaleDateString('uz-UZ');
+      const newId = fund.length > 0 ? Math.max(...fund.map(f => f.id)) + 1 : 1;
+
+      fund.unshift({ id: newId, type: type, desc: desc, amount: amount, date: today });
+      saveAll();
+      closeModal('addFundModal');
+      renderFund();
+      renderDashboard();
+      document.getElementById('fundDesc').value = '';
+      document.getElementById('fundAmount').value = '';
+    }
+
+    // 15. Oshxona
+    function renderCafeteria() {
+      const grid = document.getElementById('cafeteriaGrid');
+      grid.innerHTML = '';
+
+      cafeteriaMenu.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-3';
+        card.innerHTML = `
+          <div class="flex justify-between items-center border-b border-slate-100 dark:border-slate-800 pb-2">
+            <h4 class="font-black text-sm text-indigo-600 dark:text-indigo-400">${item.day}</h4>
+            <span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">${item.calories}</span>
+          </div>
+          <div class="space-y-2 text-xs">
+            <div>
+              <span class="font-bold text-slate-700 dark:text-slate-300">🥐 Nonushta:</span>
+              <p class="text-slate-500 dark:text-slate-400 mt-0.5">${item.breakfast}</p>
+            </div>
+            <div>
+              <span class="font-bold text-slate-700 dark:text-slate-300">🍲 Tushlik:</span>
+              <p class="text-slate-500 dark:text-slate-400 mt-0.5">${item.lunch}</p>
+            </div>
+          </div>
+        `;
+        grid.appendChild(card);
+      });
+    }
+
+    // 16. E'lonlar
+    function renderAnnouncements() {
+      const container = document.getElementById('announcementsList');
+      container.innerHTML = '';
+
+      announcements.forEach(ann => {
+        const item = document.createElement('div');
+        item.className = 'bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-2';
+        item.innerHTML = `
+          <div class="flex justify-between items-start">
+            <h4 class="font-bold text-slate-800 dark:text-white text-sm">${ann.title}</h4>
+            <span class="text-[10px] text-slate-400">${ann.date}</span>
+          </div>
+          <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">${ann.text}</p>
+          <div class="text-[10px] font-bold text-indigo-600 dark:text-indigo-400 pt-1">
+            <i class="fa-solid fa-pen-nib mr-1"></i> ${ann.author}
+          </div>
+        `;
+        container.appendChild(item);
+      });
+    }
+
+    function handleAddNewAnnouncement(e) {
+      e.preventDefault();
+      const title = document.getElementById('announcementTitle').value.trim();
+      const text = document.getElementById('announcementText').value.trim();
+      const today = new Date().toLocaleDateString('uz-UZ');
+      const newId = announcements.length > 0 ? Math.max(...announcements.map(a => a.id)) + 1 : 1;
+
+      announcements.unshift({ id: newId, title: title, text: text, date: today, author: "Sinf rahbari" });
+      saveAll();
+      closeModal('addAnnouncementModal');
+      renderAnnouncements();
+      document.getElementById('announcementTitle').value = '';
+      document.getElementById('announcementText').value = '';
+    }
+
+    // 17. Ota-ona Portali
+    function linkParent(e) {
+      e.preventDefault();
+      const code = document.getElementById('parentStudentCode').value.trim().toUpperCase();
+      const s = students.find(st => st.student_code === code);
+      if (!s) {
+        alert("❌ Bunday kodli o'quvchi topilmadi! Iltimos, o'qituvchidan olingan 6 xonali kodni to'g'ri kiriting.");
+        return;
+      }
+      if (!linkedCodes.includes(code)) {
+        linkedCodes.push(code);
+        saveAll();
+      }
+      document.getElementById('parentStudentCode').value = '';
+      renderParentPortal();
+      alert(`✅ ${s.full_name} muvaffaqiyatli bog'landi!`);
+    }
+
+    function renderParentPortal() {
+      const container = document.getElementById('parentChildrenList');
+      container.innerHTML = '';
+
+      if (linkedCodes.length === 0) {
+        container.innerHTML = `<div class="col-span-2 text-center py-6 text-xs text-slate-400">Hozircha farzand bog'lanmagan. Yuqoriga 6 xonali ID kodni kiriting.</div>`;
+        return;
+      }
+
+      linkedCodes.forEach(code => {
+        const s = students.find(st => st.student_code === code);
+        if (!s) return;
+
+        const stats = getStudentStats(s.id);
+        const gpa = getStudentAverageGrade(s.id);
+        const studentGrades = grades[s.id] || {};
+
+        let gradesHtml = '';
+        for (const [sub, gList] of Object.entries(studentGrades)) {
+          gradesHtml += `<div class="flex justify-between items-center text-xs py-1 border-b border-slate-50 dark:border-slate-800">
+            <span class="text-slate-600 dark:text-slate-300 font-medium">${sub}:</span>
+            <div class="space-x-1">${gList.map(g => `<span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold ${g === 5 ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300' : 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300'}">${g}</span>`).join('')}</div>
+          </div>`;
+        }
+
+        const div = document.createElement('div');
+        div.className = 'bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm border border-slate-200/80 dark:border-slate-800 space-y-3';
+        div.innerHTML = `
+          <div class="flex justify-between items-start">
+            <div>
+              <h4 class="font-extrabold text-base text-slate-800 dark:text-white">${s.full_name}</h4>
+              <p class="text-xs font-mono text-indigo-600 dark:text-indigo-400 font-bold">ID: ${s.student_code}</p>
+            </div>
+            <span class="px-2.5 py-1 rounded-xl text-xs font-black bg-amber-50 dark:bg-amber-950 text-amber-800 dark:text-amber-300">⭐ ${gpa} GPA</span>
+          </div>
+
+          <div class="grid grid-cols-3 gap-2 text-center text-xs pt-1">
+            <div class="bg-emerald-50 dark:bg-emerald-950/40 rounded-xl p-2">
+              <div class="font-black text-emerald-700 dark:text-emerald-300">${stats.present}</div>
+              <div class="text-[10px] text-emerald-600/80">Bor</div>
+            </div>
+            <div class="bg-rose-50 dark:bg-rose-950/40 rounded-xl p-2">
+              <div class="font-black text-rose-700 dark:text-rose-300">${stats.absent}</div>
+              <div class="text-[10px] text-rose-600/80">Yo'q</div>
+            </div>
+            <div class="bg-amber-50 dark:bg-amber-950/40 rounded-xl p-2">
+              <div class="font-black text-amber-700 dark:text-amber-300">${stats.excused}</div>
+              <div class="text-[10px] text-amber-600/80">Sababli</div>
+            </div>
+          </div>
+
+          <div class="space-y-1 pt-1">
+            <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Fan Baholari:</div>
+            ${gradesHtml}
+          </div>
+
+          <div class="pt-2 border-t border-slate-100 dark:border-slate-800 flex justify-between items-center">
+            <a href="tel:+998901112233" class="px-3 py-1.5 rounded-xl bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 text-xs font-bold transition flex items-center space-x-1.5">
+              <i class="fa-solid fa-phone"></i>
+              <span>Sinf Rahbariga Qo'ng'iroq</span>
+            </a>
+          </div>
+        `;
+        container.appendChild(div);
+      });
+    }
+
+    // 18. Yordamchi Funksiyalar
+    function generateStudentCode() {
+      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      let code = "";
+      for (let i = 0; i < 6; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return code;
+    }
+
+    function getStudentStats(studentId) {
+      let present = 0, absent = 0, excused = 0;
+      for (const d in attendanceRecords) {
+        const st = attendanceRecords[d][studentId];
+        if (st === 'present') present++;
+        else if (st === 'absent') absent++;
+        else if (st === 'excused') excused++;
+      }
+      const total = present + absent + excused;
+      const percent = total > 0 ? Math.round((present / total) * 100) : 100;
+      return { present, absent, excused, total, percent };
+    }
+
+    function getStudentAverageGrade(studentId) {
+      const sGrades = grades[studentId] || {};
+      let sum = 0, count = 0;
+      for (const sub in sGrades) {
+        sGrades[sub].forEach(g => {
+          sum += g;
+          count++;
+        });
+      }
+      return count > 0 ? (sum / count).toFixed(1) : "5.0";
+    }
+
+    function openStudentProfile(studentId) {
+      const s = students.find(st => st.id === studentId);
+      if (!s) return;
+
+      document.getElementById('modalStudentName').innerText = s.full_name;
+      document.getElementById('modalStudentCode').innerText = "ID: " + s.student_code;
+      const initials = s.full_name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase();
+      document.getElementById('modalStudentAvatar').innerText = initials;
+
+      const stats = getStudentStats(studentId);
+      document.getElementById('modalStudentAttendance').innerText = stats.percent + "% (" + stats.present + " kun bor)";
+      document.getElementById('modalStudentGPA').innerText = getStudentAverageGrade(studentId) + " / 5.0";
+
+      const gradesList = document.getElementById('modalStudentGradesList');
+      gradesList.innerHTML = '';
+      const sGrades = grades[studentId] || {};
+
+      for (const [sub, gList] of Object.entries(sGrades)) {
+        const row = document.createElement('div');
+        row.className = 'flex justify-between items-center text-xs py-1.5 border-b border-slate-100 dark:border-slate-800';
+        row.innerHTML = `
+          <span class="font-bold text-slate-700 dark:text-slate-300">${sub}:</span>
+          <div class="flex items-center space-x-1">
+            ${gList.map(g => `<span class="w-6 h-6 flex items-center justify-center rounded text-[11px] font-black ${g === 5 ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300' : 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300'}">${g}</span>`).join('')}
+          </div>
+        `;
+        gradesList.appendChild(row);
+      }
+
+      openModal('studentProfileModal');
+    }
+
+    function exportToCSV() {
+      let csv = "ID,F.I.SH,Student Code,Telefon,Davomat_Foizi,GPA\n";
+      students.forEach(s => {
+        const stats = getStudentStats(s.id);
+        const gpa = getStudentAverageGrade(s.id);
+        csv += `${s.id},"${s.full_name}","${s.student_code}","${s.phone || ''}",${stats.percent}%,${gpa}\n`;
+      });
+
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `EDU_MEMORY_${new Date().toISOString().split('T')[0]}.csv`;
+      a.click();
+    }
+
+    function exportBackupJSON() {
+      const data = { admins, teachers, students, schedule, homework, fund, announcements, libraryBooks, quizList, cafeteriaMenu, grades, attendanceRecords, linkedCodes };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `EDU_MEMORY_BACKUP_${new Date().toISOString().split('T')[0]}.json`;
+      a.click();
+    }
+
+    function resetToSampleData() {
+      localStorage.clear();
+      location.reload();
+    }
+
+    function handleGlobalSearch(e) {
+      const q = e.target.value.toLowerCase().trim();
+      if (!q) {
+        renderStudentsTable();
+        return;
+      }
+      const filtered = students.filter(s => s.full_name.toLowerCase().includes(q) || s.student_code.toLowerCase().includes(q));
+      const tbody = document.getElementById('studentsTableBody');
+      if (tbody) {
+        tbody.innerHTML = '';
+        filtered.forEach((s, idx) => {
+          const stats = getStudentStats(s.id);
+          const gpa = getStudentAverageGrade(s.id);
+          const tr = document.createElement('tr');
+          tr.className = 'hover:bg-slate-50 dark:hover:bg-slate-800/40 transition cursor-pointer';
+          tr.onclick = () => openStudentProfile(s.id);
+          tr.innerHTML = `
+            <td class="px-4 py-3 font-semibold text-slate-400">${idx + 1}</td>
+            <td class="px-4 py-3 font-bold text-slate-800 dark:text-white">${s.full_name}</td>
+            <td class="px-4 py-3 font-mono text-xs font-bold text-indigo-600 dark:text-indigo-400">${s.student_code}</td>
+            <td class="px-4 py-3 text-center"><span class="font-bold">${stats.percent}%</span></td>
+            <td class="px-4 py-3 text-center"><span class="font-black text-amber-500">${gpa} ⭐</span></td>
+            <td class="px-4 py-3 text-right">
+              <button onclick="event.stopPropagation(); deleteStudentAction(${s.id}, '${s.full_name}')" class="w-8 h-8 rounded-lg bg-rose-50 hover:bg-rose-600 hover:text-white text-rose-600 text-xs transition inline-flex items-center justify-center"><i class="fa-solid fa-trash-can"></i></button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        });
+      }
+    }
+
+    function openModal(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove('hidden');
+    }
+
+    function closeModal(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.add('hidden');
+    }
+
+    function init() {
+      initTheme();
+      populateSubjects();
+      updateLiveClock();
+      renderDashboard();
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
+"""
+
+
+async def handle_index(_request: web.Request) -> web.Response:
+    candidates = [
+        Path(__file__).parent / "index.html",
+        Path.cwd() / "index.html",
+        Path(__file__).parent / "edu_memory" / "index.html",
+        Path.cwd() / "edu_memory" / "index.html",
+        Path(__file__).parent / "YANGI_VERSIYA_PRO" / "index.html",
+        Path.cwd() / "YANGI_VERSIYA_PRO" / "index.html",
+    ]
+    for c in candidates:
+        if c.exists():
+            return web.Response(text=c.read_text(encoding="utf-8"), content_type="text/html; charset=utf-8")
+    return web.Response(text=HTML_PAGE, content_type="text/html; charset=utf-8")
+
+
+async def handle_get_students(_request: web.Request) -> web.Response:
+    async with sessionmaker() as session:
+        students = await repo.list_students(session)
+        out = []
+        for s in students:
+            st = await repo.get_stats(session, s.id)
+            out.append({
+                "id": s.id,
+                "full_name": s.full_name,
+                "student_code": s.student_code,
+                "present": st.present,
+                "absent": st.absent,
+                "excused": st.excused,
+                "total": st.total,
+                "percent": round(st.percent, 1),
+            })
+        return web.json_response(out)
+
+
+async def handle_add_student(request: web.Request) -> web.Response:
+    data = await request.json()
+    name = (data.get("full_name") or "").strip()
+    if not name:
+        return web.json_response({"error": "Ism kiritilmadi"}, status=400)
+    async with sessionmaker() as session:
+        student = await repo.add_student(session, name)
+        return web.json_response({
+            "id": student.id,
+            "full_name": student.full_name,
+            "student_code": student.student_code,
+        })
+
+
+async def handle_delete_student(request: web.Request) -> web.Response:
+    sid = int(request.match_info["id"])
+    async with sessionmaker() as session:
+        ok = await repo.delete_student(session, sid)
+        return web.json_response({"ok": ok})
+
+
+async def handle_get_attendance(request: web.Request) -> web.Response:
+    date_str = request.query.get("date")
+    day = date.fromisoformat(date_str) if date_str else date.today()
+    async with sessionmaker() as session:
+        att = await repo.get_attendance_map(session, day)
+        return web.json_response(att)
+
+
+async def handle_save_attendance(request: web.Request) -> web.Response:
+    data = await request.json()
+    day = date.fromisoformat(data["date"])
+    statuses = {int(k): v for k, v in data.get("statuses", {}).items()}
+    async with sessionmaker() as session:
+        count = await repo.save_attendance(session, day, statuses)
+        return web.json_response({"saved_count": count})
+
+
+async def handle_link_parent(request: web.Request) -> web.Response:
+    data = await request.json()
+    code = (data.get("code") or "").strip()
+    async with sessionmaker() as session:
+        student = await repo.get_student_by_code(session, code)
+        if not student:
+            return web.json_response({"success": False, "message": "❌ Bunday kodli o'quvchi topilmadi!"})
+        linked = await repo.link_parent(session, DEMO_PARENT_CHAT_ID, student.id)
+        if linked:
+            return web.json_response({"success": True, "message": f"✅ {student.full_name} muvaffaqiyatli bog'landi!"})
+        return web.json_response({"success": False, "message": f"ℹ️ {student.full_name} allaqachon bog'langan!"})
+
+
+async def handle_parent_children(_request: web.Request) -> web.Response:
+    async with sessionmaker() as session:
+        children = await repo.get_children(session, DEMO_PARENT_CHAT_ID)
+        out = []
+        for c in children:
+            st = await repo.get_stats(session, c.id)
+            out.append({
+                "id": c.id,
+                "full_name": c.full_name,
+                "student_code": c.student_code,
+                "present": st.present,
+                "absent": st.absent,
+                "excused": st.excused,
+                "percent": round(st.percent, 1),
+            })
+        return web.json_response(out)
+
+
+async def handle_weekly_report(_request: web.Request) -> web.Response:
+    today = date.today()
+    w_start, w_end, _ = weekly_period(today)
+    async with sessionmaker() as session:
+        children = await repo.get_children(session, DEMO_PARENT_CHAT_ID)
+        blocks = []
+        for c in children:
+            st = await repo.get_stats(session, c.id, w_start, w_end)
+            blocks.append(_child_block(c.full_name, st.present, st.absent, st.excused, st.percent))
+        text = (
+            "📊 EDU MEMORY\n"
+            f"📅 Haftalik davomat hisoboti\n"
+            f"🗓 {fmt_date(w_start)} — {fmt_date(w_end)}\n\n" + "\n\n".join(blocks)
+        )
+        return web.json_response({"text": text.replace("<b>", "").replace("</b>", "")})
+
+
+async def create_app() -> web.Application:
+    await init_db(engine)
+    async with sessionmaker() as session:
+        await populate_sample_data_if_empty(session)
+
+    app = web.Application()
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/api/students", handle_get_students)
+    app.router.add_post("/api/students", handle_add_student)
+    app.router.add_delete("/api/students/{id}", handle_delete_student)
+    app.router.add_get("/api/attendance", handle_get_attendance)
+    app.router.add_post("/api/attendance", handle_save_attendance)
+    app.router.add_post("/api/parent/link", handle_link_parent)
+    app.router.add_get("/api/parent/children", handle_parent_children)
+    app.router.add_get("/api/reports/weekly", handle_weekly_report)
+    return app
+
+
+if __name__ == "__main__":
+    import os
+    port = int(os.getenv("PORT", 5000))
+    app = asyncio.run(create_app())
+    web.run_app(app, host="0.0.0.0", port=port)
